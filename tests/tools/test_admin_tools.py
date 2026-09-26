@@ -38,7 +38,7 @@ def mock_canvas_api():
 
 def get_tool_function(tool_name: str):
     """Retrieve a registered tool function by name."""
-    from mcp.server.fastmcp import FastMCP
+    from fastmcp import FastMCP
 
     from canvas_mcp.tools.admin_tools import register_admin_tools
 
@@ -155,26 +155,8 @@ class TestListGroups:
 
         assert "Error" in result
 
-    @pytest.mark.asyncio
-    async def test_list_groups_anonymization_failure_logs_warning(self, mock_canvas_api):
-        """A failing member anonymization is reported via log_warning, not print."""
-        mock_canvas_api['fetch_all_paginated_results'].side_effect = [
-            [{"id": 1, "name": "Group A", "group_category_id": 10, "members_count": 1}],
-            [{"id": 101, "name": "Alice", "email": "alice@example.com"}],
-        ]
-
-        with patch(
-            'canvas_mcp.tools.admin_tools.anonymize_response_data',
-            side_effect=RuntimeError("alice@example.com"),
-        ), patch('canvas_mcp.tools.admin_tools.log_warning') as mock_warn:
-            fn = get_tool_function('list_groups')
-            result = await fn("badm_350_120251")
-
-        mock_warn.assert_called_once()
-        _, kwargs = mock_warn.call_args
-        assert kwargs.get("error_type") == "RuntimeError"
-        assert "alice@example.com" not in str(mock_warn.call_args)
-        assert "Group A" in result  # falls back to original data
+    # Tool-layer anonymization (and its failure-fallback tests) removed in #179:
+    # anonymization happens once, at the client layer, enforced by ruff TID251.
 
 
 # ---------------------------------------------------------------------------
@@ -228,36 +210,6 @@ class TestListUsers:
         result = await fn("badm_350_120251")
 
         assert "Error" in result
-
-    @pytest.mark.asyncio
-    async def test_list_users_anonymization_failure_logs_warning(self, mock_canvas_api):
-        """A failing anonymization is reported via log_warning (stderr), not print.
-
-        Bare print() would corrupt the MCP stdio JSON-RPC stream, and str(e) could
-        leak the PII that failed to scrub. The handler must route through
-        log_warning, log only the exception type, and continue with original data.
-        """
-        mock_canvas_api['fetch_all_paginated_results'].return_value = [
-            {"id": 201, "name": "Alice Smith", "email": "alice@example.com",
-             "enrollments": [{"role": "StudentEnrollment"}]},
-        ]
-
-        with patch(
-            'canvas_mcp.tools.admin_tools.anonymize_response_data',
-            side_effect=RuntimeError("alice@example.com"),
-        ), patch('canvas_mcp.tools.admin_tools.log_warning') as mock_warn:
-            fn = get_tool_function('list_users')
-            result = await fn("badm_350_120251")
-
-        # Warning routed to logger, not stdout
-        mock_warn.assert_called_once()
-        _, kwargs = mock_warn.call_args
-        # Only the exception type is logged — never the PII-bearing message
-        assert kwargs.get("error_type") == "RuntimeError"
-        assert "alice@example.com" not in str(mock_warn.call_args)
-        # Falls back to original (un-anonymized) data so the tool still works
-        assert "201" in result
-
 
 # ---------------------------------------------------------------------------
 # get_student_analytics
@@ -314,25 +266,48 @@ class TestGetStudentAnalytics:
 
         assert "0" in result or "No" in result or "students" in result.lower()
 
+# ---------------------------------------------------------------------------
+# create_student_anonymization_map
+# ---------------------------------------------------------------------------
+
+class TestCreateStudentAnonymizationMap:
+    """This tool exists to record which real student each pseudonym stands for.
+    Fetching the roster through the anonymizer made it map pseudonyms to
+    pseudonyms — a broken tool, not a privacy control (issue #179)."""
+
     @pytest.mark.asyncio
-    async def test_get_student_analytics_anonymization_failure_logs_warning(self, mock_canvas_api):
-        """A failing student anonymization is reported via log_warning, not print."""
-        mock_canvas_api['make_canvas_request'].return_value = {
-            "id": 60366, "name": "Business Administration 350"
-        }
-        mock_canvas_api['fetch_all_paginated_results'].side_effect = [
-            [{"id": 301, "name": "Alice", "email": "alice@example.com"}],  # students
-            [{"id": 401, "name": "HW1", "published": True, "points_possible": 100}],  # assignments
+    async def test_roster_fetch_skips_anonymization(self, mock_canvas_api, tmp_path,
+                                                    monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        mock_canvas_api['fetch_all_paginated_results'].return_value = [
+            {"id": 301, "name": "Alice Example", "email": "alice@illinois.edu"},
         ]
 
-        with patch(
-            'canvas_mcp.tools.admin_tools.anonymize_response_data',
-            side_effect=RuntimeError("alice@example.com"),
-        ), patch('canvas_mcp.tools.admin_tools.log_warning') as mock_warn:
-            fn = get_tool_function('get_student_analytics')
-            await fn("badm_350_120251")
+        fn = get_tool_function('create_student_anonymization_map')
+        assert fn is not None
+        await fn("badm_350_120251")
 
-        mock_warn.assert_called_once()
-        _, kwargs = mock_warn.call_args
-        assert kwargs.get("error_type") == "RuntimeError"
-        assert "alice@example.com" not in str(mock_warn.call_args)
+        _, kwargs = mock_canvas_api['fetch_all_paginated_results'].call_args
+        assert kwargs.get("skip_anonymization") is True
+
+    @pytest.mark.asyncio
+    async def test_csv_records_real_identities(self, mock_canvas_api, tmp_path,
+                                               monkeypatch):
+        """The CSV must hold the real name/email, keyed to the same pseudonym
+        the anonymizer would generate — otherwise it cannot be joined back."""
+        from canvas_mcp.core.anonymization import generate_anonymous_id
+
+        monkeypatch.chdir(tmp_path)
+        mock_canvas_api['fetch_all_paginated_results'].return_value = [
+            {"id": 301, "name": "Alice Example", "email": "alice@illinois.edu"},
+        ]
+
+        fn = get_tool_function('create_student_anonymization_map')
+        result = await fn("badm_350_120251")
+
+        assert "Error" not in result
+        written = (tmp_path / "local_maps").glob("anonymization_map_*.csv")
+        content = next(written).read_text()
+        assert "Alice Example" in content
+        assert "alice@illinois.edu" in content
+        assert generate_anonymous_id(301) in content

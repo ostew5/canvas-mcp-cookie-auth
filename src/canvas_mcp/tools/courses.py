@@ -2,8 +2,10 @@
 
 import html
 import re
+from html.parser import HTMLParser
+from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ..core.cache import (
@@ -13,8 +15,110 @@ from ..core.cache import (
     id_to_course_code_cache,
 )
 from ..core.client import fetch_all_paginated_results, make_canvas_request
+from ..core.config import get_config
 from ..core.dates import format_date
+from ..core.untrusted_content import (
+    FENCE_LEAK_ERROR,
+    contains_fence_markers,
+    fence_untrusted,
+    fence_untrusted_inline,
+)
 from ..core.validation import validate_params
+from ..core.write_confirmation import (
+    ConfirmationGuard,
+    preview_with_token,
+    redeem_confirmation,
+    unconfirmed_write_warning,
+)
+from .self_identity import _own_roles
+
+# Replacing a syllabus that already has content destroys the only copy Canvas
+# keeps -- syllabus_body carries no revision history, unlike a wiki page. So
+# that one case takes the same preview->token->confirm path as the delete
+# tools; writing into an empty syllabus, or appending, has nothing to lose and
+# stays a single call.
+_UPDATE_SYLLABUS_GUARD = ConfirmationGuard(
+    nothing_done="The syllabus was not changed."
+)
+
+
+def _syllabus_text(body: str) -> str:
+    """Visible text of a syllabus body, whitespace-collapsed, for comparison."""
+    return " ".join(strip_html_tags(body).split())
+
+
+class _MediaCollector(HTMLParser):
+    """Collect embedded-media elements from a Canvas page body.
+
+    ``source`` is deliberately not collected: it only appears inside
+    ``<video>``/``<audio>``, which are already collected, and counting both
+    would double-report one player.
+    """
+
+    MEDIA_TAGS = frozenset({"img", "iframe", "video", "audio", "embed", "object"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.items: list[dict[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in self.MEDIA_TAGS:
+            return
+        attr = {k: (v or "") for k, v in attrs}
+        self.items.append({
+            "tag": tag,
+            # <object> uses data=, everything else src=.
+            "src": attr.get("src") or attr.get("data") or "",
+            "alt": attr.get("alt") or attr.get("title") or "",
+        })
+
+
+def extract_embedded_media(html_content: str) -> list[dict[str, str]]:
+    """List the images, videos and embeds in a page body, in document order.
+
+    Canvas page bodies carry course media as ``<img>``/``<iframe>`` markup.
+    Any plain-text rendering deletes those tags, and because they are void or
+    attribute-only elements the media vanishes without leaving so much as a
+    placeholder -- the reader cannot tell anything was there (issue #233).
+
+    Uses stdlib ``HTMLParser``, which is lenient about the unclosed and
+    malformed markup real Canvas pages contain. Duplicates (same tag and same
+    src) are collapsed, since Canvas often repeats a thumbnail and its link.
+    """
+    if not html_content:
+        return []
+
+    collector = _MediaCollector()
+    try:
+        collector.feed(html_content)
+        collector.close()
+    except Exception:  # pragma: no cover - HTMLParser is lenient by design
+        return collector.items
+
+    seen: set[tuple[str, str]] = set()
+    unique: list[dict[str, str]] = []
+    for item in collector.items:
+        key = (item["tag"], item["src"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def format_media_inventory(media: list[dict[str, str]]) -> str:
+    """Render an embedded-media list as a labelled section, or '' if empty."""
+    if not media:
+        return ""
+
+    lines = [f"\n\nEmbedded media ({len(media)}):"]
+    for item in media:
+        src = item["src"] or "(no src attribute)"
+        line = f"- {item['tag']}: {src}"
+        if item["alt"]:
+            line += f" — {item['alt']}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def strip_html_tags(html_content: str) -> str:
@@ -65,13 +169,20 @@ def strip_html_tags(html_content: str) -> str:
     return text.strip()
 
 
-def register_course_tools(mcp: FastMCP):
+def register_course_tools(mcp: FastMCP) -> None:
     """Register all course-related MCP tools."""
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
-    async def list_courses(include_concluded: bool = False, include_all: bool = False) -> str:
-        """List courses for the authenticated user."""
+    async def list_courses(
+        include_concluded: bool = False, include_all: bool = False
+    ) -> str:
+        """List courses for the authenticated user.
+
+        Args:
+            include_concluded: Include concluded/past enrollments in the results.
+            include_all: Include all enrollments instead of only current active ones.
+        """
 
         params = {
             "include[]": ["term", "teachers", "total_students"],
@@ -79,7 +190,17 @@ def register_course_tools(mcp: FastMCP):
         }
 
         if not include_all:
-            params["enrollment_type"] = "teacher"
+            # Scope to the user's *current* enrollments. enrollment_state="active"
+            # is Canvas's canonical "current" signal; the course state[] filter
+            # below cannot distinguish current from past at institutions that
+            # never flip finished courses to workflow_state="completed".
+            params["enrollment_state"] = "active"
+            # Educators keep teacher-only scoping (unchanged behavior). Students
+            # and the "all" profile see every active enrollment, which is what a
+            # Shared tool should return — the old unconditional teacher filter
+            # returned nothing for students.
+            if get_config().canvas_role == "educator":
+                params["enrollment_type"] = "teacher"
 
         if include_concluded:
             params["state[]"] = ["available", "completed"]
@@ -109,12 +230,20 @@ def register_course_tools(mcp: FastMCP):
             name = course.get("name", "Unnamed course")
             code = course.get("course_code", "No code")
 
+            # Canvas already ships the caller's own enrollments[] on /courses
+            # (no include[] needed); dropping it used to force callers toward
+            # roster tools they have no permission for (issue #171).
+            roles = _own_roles(course)
+            role_line = f"Your role: {', '.join(roles)}\n" if roles else ""
+
             # Emphasize code in the output
-            courses_info.append(f"Code: {code}\nName: {name}\nID: {course_id}\n")
+            courses_info.append(
+                f"Code: {code}\nName: {name}\nID: {course_id}\n{role_line}"
+            )
 
         return "Courses:\n\n" + "\n".join(courses_info)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_course_details(course_identifier: str | int) -> str:
         """Get detailed information about a specific course.
@@ -145,11 +274,20 @@ def register_course_tools(mcp: FastMCP):
             f"Blueprint: {response.get('blueprint', False)}"
         ]
 
+        # Surface the caller's own role. Say so explicitly when there is none —
+        # silence reads as "unknown" and sends agents to roster tools they cannot
+        # use (issue #171).
+        roles = _own_roles(response)
+        if roles:
+            details.append(f"Your role: {', '.join(roles)}")
+        else:
+            details.append("Your role: You have no enrollment in this course")
+
         # Prefer to show course code in the output
         course_display = response.get("course_code", course_identifier)
         return f"Course Details for {course_display}:\n\n" + "\n".join(details)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_syllabus(course_identifier: str | int,
                            output_format: str = "text",
@@ -204,17 +342,25 @@ def register_course_tools(mcp: FastMCP):
         labeled = fmt == "both"
         sections = [f"Syllabus for Course {course_display}:"]
 
+        # Syllabus bodies are course-authored free text (issue 239): fence them
+        # so embedded directives arrive marked as data, not instructions.
         if fmt in ("text", "both"):
             plain_text = _maybe_truncate(strip_html_tags(syllabus_body))
-            sections.append(("\n--- Plain Text ---\n" if labeled else "\n") + plain_text)
+            sections.append(
+                ("\n--- Plain Text ---\n" if labeled else "\n")
+                + fence_untrusted(plain_text, "course syllabus")
+            )
 
         if fmt in ("html", "both"):
             raw_html = _maybe_truncate(syllabus_body)
-            sections.append(("\n--- Raw HTML ---\n" if labeled else "\n") + raw_html)
+            sections.append(
+                ("\n--- Raw HTML ---\n" if labeled else "\n")
+                + fence_untrusted(raw_html, "course syllabus")
+            )
 
         return "\n".join(sections)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_course_content_overview(course_identifier: str | int,
                                         include_pages: bool = True,
@@ -263,7 +409,12 @@ def register_course_tools(mcp: FastMCP):
                     for page in sorted_pages[:5]:
                         title = page.get("title", "Untitled")
                         updated = format_date(page.get("updated_at"))
-                        pages_summary.append(f"    {title} (Updated: {updated})")
+                        # Page titles are author-controlled where page editing
+                        # is open to students (issue 239).
+                        pages_summary.append(
+                            f"    {fence_untrusted(title, 'page title')} "
+                            f"(Updated: {updated})"
+                        )
 
                 overview_sections.append("\n".join(pages_summary))
 
@@ -277,7 +428,7 @@ def register_course_tools(mcp: FastMCP):
                 ]
 
                 # Count module items by type across all modules
-                item_type_counts = {}
+                item_type_counts: dict[str, int] = {}
                 total_items = 0
 
                 for module in modules[:10]:  # Limit to first 10 modules to avoid too many API calls
@@ -305,7 +456,10 @@ def register_course_tools(mcp: FastMCP):
                     for module in modules[:3]:
                         name = module.get("name", "Unnamed")
                         state = module.get("state", "unknown")
-                        modules_summary.append(f"    {name} (Status: {state})")
+                        # Module names are instructor-authored (issue 239).
+                        modules_summary.append(
+                            f"    {fence_untrusted_inline(name, 'module name')} (Status: {state})"
+                        )
 
                 overview_sections.append("\n".join(modules_summary))
 
@@ -329,10 +483,13 @@ def register_course_tools(mcp: FastMCP):
                     if len(clean_syllabus) > 1000:
                         clean_syllabus = clean_syllabus[:1000] + "..."
 
+                    indented = "\n".join(
+                        [f"  {line}" for line in clean_syllabus.split('\n') if line.strip()]
+                    )
                     syllabus_summary = [
                         "\nSyllabus Content:",
-                        # Indent the content
-                        "\n".join([f"  {line}" for line in clean_syllabus.split('\n') if line.strip()])
+                        # Course-authored free text (issue 239): fence it.
+                        fence_untrusted(indented, "course syllabus (preview)")
                     ]
 
                     overview_sections.append("\n".join(syllabus_summary))
@@ -347,10 +504,10 @@ def register_course_tools(mcp: FastMCP):
         return result
 
 
-def register_shared_content_tools(mcp: FastMCP):
+def register_shared_content_tools(mcp: FastMCP) -> None:
     """Register shared content tools (pages, module items) for both students and educators."""
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def list_pages(course_identifier: str | int,
                         sort: str | None = "title",
@@ -368,7 +525,7 @@ def register_shared_content_tools(mcp: FastMCP):
         """
         course_id = await get_course_id(course_identifier)
 
-        params = {"per_page": 100}
+        params: dict[str, Any] = {"per_page": 100}
 
         if sort:
             params["sort"] = sort
@@ -397,17 +554,26 @@ def register_shared_content_tools(mcp: FastMCP):
 
             front_page_indicator = " (Front Page)" if is_front_page else ""
 
+            # Page titles are author-controlled where page editing is open to
+            # students (issue 239) — fenced in listings too.
             pages_info.append(
-                f"URL: {url}\nTitle: {title}{front_page_indicator}\nStatus: {published_status}\nUpdated: {updated_at}\n"
+                f"URL: {url}\n"
+                f"Title{front_page_indicator}:\n{fence_untrusted(title, 'page title')}\n"
+                f"Status: {published_status}\nUpdated: {updated_at}\n"
             )
 
         course_display = await get_course_code(course_id) or course_identifier
         return f"Pages for Course {course_display}:\n\n" + "\n".join(pages_info)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_page_content(course_identifier: str | int, page_url_or_id: str) -> str:
         """Get the full content body of a specific page.
+
+        Returns the page's raw HTML body untruncated, followed by an inventory
+        of any embedded media (images, videos, iframes) with their source URLs,
+        so media is reported explicitly rather than left for the reader to spot
+        in the markup.
 
         Args:
             course_identifier: Course code or Canvas ID
@@ -425,17 +591,37 @@ def register_shared_content_tools(mcp: FastMCP):
         published = response.get("published", False)
 
         if not body:
-            return f"Page '{title}' has no content."
+            return "This page has no content. Its title:\n" + fence_untrusted(
+                title, "page title"
+            )
 
         course_display = await get_course_code(course_id) or course_identifier
         status = "Published" if published else "Unpublished"
 
-        return f"Page Content for '{title}' in Course {course_display} ({status}):\n\n{body}"
+        # Title, body, AND the media inventory derived from the body are all
+        # page-author-controlled (issue 239) — every one of them goes inside
+        # a single fence; only our own framing stays outside. The inventory is
+        # computed from the raw body BEFORE fencing, so spoof-neutralization
+        # can never alter what it sees.
+        untrusted = (
+            f"Title: {title}\n\n{body}"
+            + format_media_inventory(extract_embedded_media(body))
+        )
+        return (
+            f"Page Content for page '{page_url_or_id}' in Course {course_display} ({status}):\n\n"
+            + fence_untrusted(untrusted, "page title, body, and media inventory")
+        )
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_page_details(course_identifier: str | int, page_url_or_id: str) -> str:
-        """Get detailed information about a specific page.
+        """Get a specific page's metadata plus a short text preview.
+
+        Returns settings (status, timestamps, editor, editing roles) and a
+        PLAIN-TEXT preview capped at 500 characters. The preview drops all
+        markup, so embedded media is listed separately rather than silently
+        disappearing. For the full body, including media markup, use
+        get_page_content.
 
         Args:
             course_identifier: Course code or Canvas ID
@@ -460,16 +646,23 @@ def register_shared_content_tools(mcp: FastMCP):
 
         # Handle last edited by user info
         last_edited_by = response.get("last_edited_by", {})
-        editor_name = last_edited_by.get("display_name", "Unknown") if last_edited_by else "Unknown"
+        editor_name_raw = last_edited_by.get("display_name", "Unknown") if last_edited_by else "Unknown"
+        # Editor display name is author-controlled where names are editable (issue 239).
+        editor_name = fence_untrusted_inline(editor_name_raw, "editor display name")
 
-        # Clean up body text for display
+        # Build a TEXT PREVIEW of the body. Both lossy steps below must announce
+        # themselves: a silent strip made 4 embedded videos vanish from a real
+        # course page with no trace in the output (issue #233), and a bare "..."
+        # does not tell the reader a fixed budget was hit.
+        #
+        # strip_html_tags (not a bare `<[^>]+>` regex) because it also drops
+        # <script>/<style> CONTENTS. The naive form deletes only the tags, which
+        # promotes script text into what reads as page prose.
+        media = extract_embedded_media(body)
         if body:
-            # Remove HTML tags for cleaner display
-            import re
-            body_clean = re.sub(r'<[^>]+>', '', body)
-            body_clean = body_clean.strip()
+            body_clean = strip_html_tags(body).strip()
             if len(body_clean) > 500:
-                body_clean = body_clean[:500] + "..."
+                body_clean = body_clean[:500] + "\n...[text preview truncated at 500 characters]"
         else:
             body_clean = "No content"
 
@@ -488,18 +681,32 @@ def register_shared_content_tools(mcp: FastMCP):
         course_display = await get_course_code(course_id) or course_identifier
 
         result = f"Page Details for Course {course_display}:\n\n"
-        result += f"Title: {title}\n"
         result += f"URL: {url}\n"
         result += f"Status: {', '.join(status_info)}\n"
         result += f"Created: {created_at}\n"
         result += f"Updated: {updated_at}\n"
         result += f"Last Edited By: {editor_name}\n"
         result += f"Editing Roles: {editing_roles or 'Not specified'}\n"
-        result += f"\nContent Preview:\n{body_clean}"
+
+        # Title, text preview, and media src URLs are all page-author-
+        # controlled (issue 239): one fence around the lot, our framing
+        # outside it.
+        untrusted = f"Title: {title}\n\nContent Preview (text only, truncated):\n{body_clean}"
+        if media:
+            untrusted += (
+                f"\n\n{len(media)} embedded media item(s) are present but not shown "
+                "in this text preview — use get_page_content for the full HTML:"
+            )
+            for item in media:
+                untrusted += f"\n- {item['tag']}: {item['src'] or '(no src attribute)'}"
+
+        result += "\n" + fence_untrusted(
+            untrusted, "page title, text preview, and media inventory"
+        )
 
         return result
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_front_page(course_identifier: str | int) -> str:
         """Get the front page content for a course.
@@ -519,13 +726,19 @@ def register_shared_content_tools(mcp: FastMCP):
         updated_at = format_date(response.get("updated_at"))
 
         if not body:
-            return f"Course front page '{title}' has no content."
+            return "The course front page has no content. Its title:\n" + fence_untrusted(
+                title, "front page title"
+            )
 
         # Try to get the course code for display
         course_display = await get_course_code(course_id) or course_identifier
-        return f"Front Page '{title}' for Course {course_display} (Updated: {updated_at}):\n\n{body}"
+        # Title and body are both page-author-controlled (issue 239).
+        return (
+            f"Front Page for Course {course_display} (Updated: {updated_at}):\n\n"
+            + fence_untrusted(f"Title: {title}\n\n{body}", "front page title and body")
+        )
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def list_module_items(course_identifier: str | int,
                                module_id: str | int,
@@ -539,7 +752,7 @@ def register_shared_content_tools(mcp: FastMCP):
         """
         course_id = await get_course_id(course_identifier)
 
-        params = {"per_page": 100}
+        params: dict[str, Any] = {"per_page": 100}
         if include_content_details:
             params["include[]"] = ["content_details"]
 
@@ -563,7 +776,11 @@ def register_shared_content_tools(mcp: FastMCP):
             module_name = module_response.get("name", "Unknown Module")
 
         course_display = await get_course_code(course_id) or course_identifier
-        result = f"Module Items for '{module_name}' in Course {course_display}:\n\n"
+        # Module name and item titles are instructor-authored (issue 239).
+        result = (
+            f"Module Items for {fence_untrusted_inline(module_name, 'module name')} "
+            f"in Course {course_display}:\n\n"
+        )
 
         for item in items:
             item_id = item.get("id")
@@ -574,7 +791,7 @@ def register_shared_content_tools(mcp: FastMCP):
             external_url = item.get("external_url", "")
             published = item.get("published", False)
 
-            result += f"Item: {title}\n"
+            result += f"Item: {fence_untrusted_inline(title, 'module item title')}\n"
             result += f"Type: {item_type}\n"
             result += f"ID: {item_id}\n"
             if content_id:
@@ -586,3 +803,197 @@ def register_shared_content_tools(mcp: FastMCP):
             result += f"Published: {'Yes' if published else 'No'}\n\n"
 
         return result
+
+
+def register_educator_course_tools(mcp: FastMCP) -> None:
+    """Register course tools that write, so need an instructor-scoped token.
+
+    Kept out of ``register_course_tools`` on purpose: that group is shared with
+    the student profile, and a student token cannot write a syllabus. Offering
+    the tool there would only produce 401s and widen the student profile's
+    write surface for no gain.
+    """
+
+    # idempotent_hint=False: a replace converges, but mode="append"/"prepend"
+    # adds the same block again on every repeat, and the hint is per-tool (a
+    # host retrying a timed-out call cannot know which mode was used).
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=False))
+    @validate_params
+    async def update_syllabus(course_identifier: str | int,
+                              syllabus_body: str,
+                              mode: str = "replace",
+                              confirmation_token: str | None = None) -> str:
+        """Set the Canvas Syllabus tab content for a course.
+
+        Canvas keeps no revision history for the syllabus, so replacing a
+        syllabus that already has content is a two-step call: call without
+        confirmation_token to get a preview plus a single-use token, show the
+        preview to the educator, and only after they approve it call again with
+        the token and identical arguments. Writing into an empty syllabus, or appending/prepending,
+        destroys nothing and takes a single call.
+
+        Args:
+            course_identifier: Course code or Canvas ID
+            syllabus_body: HTML for the syllabus. Canvas stores this as HTML;
+                plain text is accepted but renders without formatting.
+            mode: "replace" (default) swaps the whole body, "append" adds to
+                the end of the existing body, "prepend" adds to the start.
+            confirmation_token: Token from the preview call. Only needed when
+                replacing a syllabus that already has content.
+        """
+        normalized_mode = (mode or "replace").lower()
+        if normalized_mode not in ("replace", "append", "prepend"):
+            return (
+                f"Error: invalid mode '{mode}'. "
+                "Use 'replace', 'append', or 'prepend'."
+            )
+
+        # Backstop for issue 239: get_syllabus fences the body it returns, so a
+        # model round-tripping that output would otherwise write our own
+        # provenance markers into the course.
+        if contains_fence_markers(syllabus_body):
+            return FENCE_LEAK_ERROR
+
+        if not syllabus_body.strip():
+            if normalized_mode == "replace":
+                return (
+                    "Error: syllabus_body is empty. To clear a syllabus "
+                    "deliberately, pass a body such as '<p></p>'."
+                )
+            return f"Error: syllabus_body is empty, so there is nothing to {normalized_mode}."
+
+        course_id = await get_course_id(course_identifier)
+
+        current = await make_canvas_request(
+            "get",
+            f"/courses/{course_id}",
+            params={"include[]": "syllabus_body"},
+        )
+        if "error" in current:
+            return f"Error fetching current syllabus: {current['error']}"
+
+        existing_body = current.get("syllabus_body") or ""
+        course_display = current.get("course_code", course_identifier)
+        has_existing = bool(existing_body.strip())
+
+        if normalized_mode == "append":
+            new_body = f"{existing_body}\n{syllabus_body}" if has_existing else syllabus_body
+        elif normalized_mode == "prepend":
+            new_body = f"{syllabus_body}\n{existing_body}" if has_existing else syllabus_body
+        else:
+            new_body = syllabus_body
+
+        # Only a replace over existing content is unrecoverable, so only that
+        # path demands the token.
+        if normalized_mode == "replace" and has_existing:
+            # existing_body is bound too, not just the replacement: the
+            # preview shows the content about to be destroyed, and the token
+            # promises it "stops matching if the target changes in the
+            # meantime". Without it, a co-teacher editing the syllabus between
+            # preview and confirm loses work the confirmer never saw.
+            fingerprint = _UPDATE_SYLLABUS_GUARD.fingerprint(
+                "update_syllabus", str(course_id), existing_body, new_body
+            )
+            if not confirmation_token:
+                preview = (
+                    f"Would REPLACE the entire syllabus of course {course_display}.\n"
+                    f"  Replacing {len(existing_body)} characters of existing "
+                    f"content with {len(new_body)}.\n"
+                    f"  Canvas keeps no revision history for the syllabus, so "
+                    f"the current content cannot be recovered.\n\n"
+                    f"  Current syllabus (plain text):\n"
+                    f"{fence_untrusted(strip_html_tags(existing_body), 'course syllabus')}"
+                )
+                return preview_with_token(
+                    _UPDATE_SYLLABUS_GUARD,
+                    fingerprint,
+                    "update_syllabus",
+                    preview,
+                    action="replace the syllabus",
+                )
+            error = redeem_confirmation(
+                _UPDATE_SYLLABUS_GUARD, confirmation_token, fingerprint
+            )
+            if error:
+                return error
+
+        response = await make_canvas_request(
+            "put",
+            f"/courses/{course_id}",
+            data={"course": {"syllabus_body": new_body}},
+        )
+        if "error" in response:
+            return f"Error updating syllabus: {response['error']}"
+
+        # Canvas answers 200 on this PUT without echoing syllabus_body, and it
+        # drops the field entirely for a token lacking manage_course_content.
+        # Read it back rather than trusting the status code.
+        verify = await make_canvas_request(
+            "get",
+            f"/courses/{course_id}",
+            params={"include[]": "syllabus_body"},
+        )
+        saved_body = verify.get("syllabus_body") or "" if "error" not in verify else None
+
+        if saved_body is None:
+            return unconfirmed_write_warning(
+                "the syllabus update",
+                {
+                    "Course": course_display,
+                    "Mode": normalized_mode,
+                    "Canvas response": "accepted the write but the read-back failed",
+                },
+                "Open the course Syllabus tab in Canvas to check whether it saved.",
+            )
+
+        # Compare the visible text, not the markup. Canvas returns HTML it
+        # rewrote server-side: institutional themes (DesignPlus on the Canvas
+        # this was tested against) inject <link>/<script> tags into every
+        # syllabus body, and the sanitizer drops attributes such as
+        # rel="noopener". Byte equality therefore fails on writes that
+        # succeeded perfectly, which would train the reader to ignore the
+        # warning. Text containment still catches the failure that matters --
+        # a token without manage_course_content leaves the old body in place,
+        # so the text just written is absent.
+        sent_text = _syllabus_text(new_body)
+        stored_text = _syllabus_text(saved_body)
+        if sent_text and sent_text not in stored_text:
+            return unconfirmed_write_warning(
+                "the syllabus update",
+                {
+                    "Course": course_display,
+                    "Mode": normalized_mode,
+                    "Sent": f"{len(new_body)} characters",
+                    "Stored by Canvas": f"{len(saved_body)} characters",
+                },
+                "Canvas accepted the request but the syllabus does not contain "
+                "what was sent. This usually means the token lacks permission to "
+                "edit the syllabus. Check the Syllabus tab.",
+            )
+
+        verb = {
+            "replace": "Replaced",
+            "append": "Appended to",
+            "prepend": "Prepended to",
+        }[normalized_mode]
+        lines = [
+            f"✅ {verb} the syllabus of course {course_display}.\n",
+            f"  Mode: {normalized_mode}",
+            f"  Syllabus is now {len(saved_body)} characters",
+        ]
+        if sent_text:
+            lines.append("  Verified by reading the syllabus back from Canvas")
+        else:
+            # Markup with no visible text (an image or embed on its own) gives
+            # the containment check nothing to look for, so say that rather
+            # than claiming a verification that never ran.
+            lines.append(
+                "  ⚠️  Not verified: the body sent has no visible text to look "
+                "for in the read-back. Check the Syllabus tab."
+            )
+        if saved_body.strip() != new_body.strip():
+            lines.append(
+                "  Note: Canvas stored a rewritten copy of the HTML (institutional "
+                "theme injection or sanitizing). The text sent is present."
+            )
+        return "\n".join(lines)

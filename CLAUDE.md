@@ -23,11 +23,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 canvas-mcp/
 ├── src/canvas_mcp/        # Main application code
 │   ├── core/             # Core utilities (client, config, validation)
-│   ├── tools/            # MCP tool implementations (91 tools across 16 files)
+│   ├── tools/            # MCP tool implementations (up to 103 tools across 20 files)
 │   ├── resources/        # MCP resources and prompts
 │   └── server.py         # FastMCP server entry point
 ├── skills/               # Agent skills for skills.sh (8 skills)
-├── tests/                # 328 tests (pytest + pytest-asyncio)
+├── tests/                # 900+ tests (pytest + pytest-asyncio)
 ├── docs/                 # GitHub Pages site + guides
 ├── tools/                # Tool documentation (README.md, TOOL_MANIFEST.json)
 ├── archive/              # Legacy code (git-ignored)
@@ -36,57 +36,9 @@ canvas-mcp/
 
 ## Architecture Overview
 
-### Core Design Patterns
-- **FastMCP framework**: Built on FastMCP for robust MCP server implementation with proper tool registration
-- **Type-driven validation**: All MCP tools use `@validate_params` decorator with sophisticated Union/Optional type handling
-- **Dual-layer caching**: Bidirectional course code ↔ ID mapping via `course_code_to_id_cache` and `id_to_course_code_cache`
-- **Flexible identifiers**: Support for Canvas IDs, course codes, and SIS IDs through `get_course_id()` abstraction
-- **ISO 8601 standardization**: All dates converted via `format_date()` and `parse_date()` functions
+FastMCP server; type-driven validation via `@validate_params`; dual-layer course code↔ID caching; flexible identifiers (`get_course_id()`); ISO-8601 dates. Tools use a List→Details→Content→Analytics progressive-disclosure pattern, grouped by Canvas entity, named `{action}_{entity}`. All Canvas calls route through `make_canvas_request()` with async I/O, automatic pagination, and configurable anonymization.
 
-### MCP Tool Organization
-- **Progressive disclosure**: List → Details → Content → Analytics pattern
-- **Functional grouping**: Tools organized by Canvas entity (courses, assignments, discussions, messaging, etc.)
-- **Consistent naming**: `{action}_{entity}[_{specifier}]` pattern
-- **Educational analytics focus**: Student performance, completion rates, missing work identification
-- **Discussion workflow**: Browse → View → Read → Reply pattern for student interaction
-- **Messaging workflow**: Analytics → Target → Template → Send pattern for automated communications
-
-### API Layer Architecture
-- **Centralized requests**: All Canvas API calls go through `make_canvas_request()`
-- **Form data support**: Messaging endpoints use `use_form_data=True` for Canvas compatibility
-- **Automatic pagination**: `fetch_all_paginated_results()` handles Canvas pagination transparently
-- **Async throughout**: All I/O operations use async/await
-- **Graceful error handling**: Returns JSON error responses rather than raising exceptions
-- **Privacy protection**: Student data anonymization via configurable `anonymize_response_data()`
-
-## Key Components
-
-### Parameter Validation System
-- `validate_parameter()`: Runtime type coercion supporting complex types
-- `@validate_params`: Automatic validation decorator for all MCP tools
-- Handles Union types, Optional types, string→JSON conversion, comma-separated lists
-
-### Course Identifier Handling
-- `get_course_id()`: Converts any identifier type to Canvas ID
-- `get_course_code()`: Reverse lookup from ID to human-readable code
-- `refresh_course_cache()`: Rebuilds identifier mapping from Canvas API
-
-### Analytics Engine
-- `get_student_analytics()`: Multi-dimensional educational data analysis
-- `get_assignment_analytics()`: Statistical performance analysis with grade distribution
-- `get_peer_review_completion_analytics()`: Peer review tracking and completion analysis
-- `get_peer_review_comments()`: Extract actual peer review comment text and analysis
-- `analyze_peer_review_quality()`: Comprehensive comment quality analysis with metrics
-- `identify_problematic_peer_reviews()`: Automated flagging of low-quality reviews
-- Temporal filtering (current vs. all assignments)
-- Risk identification and performance categorization
-
-### Messaging System
-- `send_conversation()`: Core Canvas messaging with form data support
-- `send_peer_review_reminders()`: Automated peer review reminder workflow
-- `send_peer_review_followup_campaign()`: Complete analytics → messaging pipeline
-- `MessageTemplates`: Flexible template system for various communication types
-- Privacy-aware: Works with anonymization while preserving functional user IDs
+**Full design reference** (patterns, parameter validation, analytics engine, messaging system): [internal/architecture.md](internal/architecture.md).
 
 ## Git Workflow - ASK FIRST
 
@@ -104,75 +56,127 @@ canvas-mcp/
 
 This repo has branch protection on `main` (PR + status checks required), but admin can bypass. Always ask the user which workflow they prefer for the current task.
 
+### Parallel work: one PR = one worktree
+
+This repo often has several agents/sessions working at once. The primary checkout
+(`/Users/vishal/code/canvas-mcp`) stays on `main`, clean — treat it as read-only (triage,
+review, reading). All branch work happens in a sibling worktree named `canvas-mcp-<slug>`
+on branch `fix/NNN-slug`, created from `origin/main` (gitignored files like `.env` don't
+carry over — symlink them). Never repurpose a worktree for a different issue; remove it
+after its PR merges and delete the branch (local + remote). After any sibling PR merges,
+rebase surviving worktree branches onto `main` and rerun tests there. Full lifecycle:
+global `worktree-pr` skill.
+
+### Closing-keyword guard — run `./scripts/install-hooks.sh` once per clone
+
+GitHub closes an issue on any `fixes|closes|resolves #N` in a merged PR body **or
+a commit message landing on `main`** — including prose that only *describes*
+other work. Issue #172 was closed twice this way (PR #202's body, then commit
+`98643ce` whose message documented the first accident).
+
+`scripts/check_closing_keywords.py` is the single detector, shared by the
+`commit-msg` hook (prevention) and `.github/workflows/closing-keyword-guard.yml`
+(backstop). It blocks keywords **mid-sentence** and allows ones that **open a
+line** — `Closes #173` is a deliberate trailer, `...bug that closed #172` is
+narration. Deliberate close on a fix PR needs no ceremony; narration must be
+rephrased (`closed [issue 172]`) or bypassed with `ALLOW_CLOSING_KEYWORD=1`.
+
 ---
 
 ## Release Checklist
 
-When bumping the version in `pyproject.toml`, also update:
-- [ ] `src/canvas_mcp/__init__.py` - Update `__version__`
-- [ ] `server.json` - Update both `version` fields (top-level and packages[0]) for MCP Registry
-- [ ] `tools/TOOL_MANIFEST.json` - Update `version` field to match new version
-- [ ] `README.md` - Update "Latest Release" section with new version, date, and changelog
-- [ ] `docs/index.html` - Update version badge, tool count, and meta descriptions (GitHub Pages site)
-- [ ] Create git tag: `git tag vX.Y.Z && git push origin vX.Y.Z`
-
-> `manifest.json` (Desktop Extension) does **not** need a manual bump — `create-release.yml` stamps the tag version into it and attaches `canvas-mcp.mcpb` to the GitHub Release automatically. The committed `manifest.json` version is just a default.
+Version-bump procedure (files to update) + publish-race gotchas: **[internal/release-checklist.md](internal/release-checklist.md)**.
 
 ---
 
 ## Coding Standards
-- **Type hints**: Mandatory for all functions, use Union/Optional appropriately
+- **Type hints**: Mandatory for all functions; use PEP 604 unions (`X | Y`, `T | None`), which ruff UP enforces
 - **MCP tools**: Use `@mcp.tool()` decorator with `@validate_params`
 - **Async functions**: All API interactions must be async
-- **Course identifiers**: Use `Union[str, int]` and `get_course_id()` for flexibility
+- **Course identifiers**: Use `str | int` and `get_course_id()` for flexibility
 - **Date handling**: Use `format_date()` for all date outputs
-- **Error responses**: Return JSON strings with "error" key for failures
+- **Error responses**: dict-returning tools include an `"error"` key; string-returning tools return a human-readable `"Error ..."` message (match the module you're editing)
+- **Legacy `-> str` tools**: a few modules (notably `modules.py` and `accessibility.py`) still return JSON-stringified error objects instead of plain `"Error ..."` text; preserve the local convention when editing them
 - **Form data**: Use `use_form_data=True` for Canvas POST/PUT endpoints
 - **Privacy**: Student IDs preserved, names anonymized in `_should_anonymize_endpoint()`
-- **Optional params**: Use `Optional[T]` type hints for parameters that can be `None`
 
-## Test-Driven Development (TDD) - ENFORCED
+## Testing and behavioral evidence
 
-**All new MCP tools MUST have tests before the feature is considered complete.**
+Choose verification by the behavior at risk, not a per-tool test quota. New tools
+must have meaningful automated coverage before they are complete. Cover relevant
+success, failure, boundary, and safety behavior; several scenarios may fit one
+parameterized test, while a consequential invariant may need several kinds of
+evidence. Preserve existing regression coverage and required CI checks.
 
-### TDD Workflow
-1. **Write tests first** (or alongside) for new tools
-2. **Minimum 3 tests per tool**: success path, error handling, edge case
-3. **Run tests** before committing: `uv run python -m pytest tests/ -v`
-4. **No merging** without passing tests
+### TDD and refactoring
 
-### Test Structure
-```
-tests/
-├── tools/           # Unit tests for MCP tools
-│   ├── test_modules.py    # Reference implementation
-│   ├── test_pages.py      # Page tools tests
-│   └── ...
-└── security/        # Security-focused tests
-```
+- For a reproducible bug or a clear behavior change, write a focused failing
+  regression first. Observe it fail for the intended reason, then repair the
+  implementation and verify it passes.
+- Before refactoring, characterize behavior where the existing tests leave a
+  meaningful uncertainty. Preserve the public contract and separate intentional
+  behavior changes from structural cleanup.
+- When expected behavior is still being discovered, exploration is appropriate.
+  Establish the intended contract and meaningful verification before claiming
+  completion; do not turn exploratory output into its own test oracle.
 
-### Test Patterns (from test_modules.py)
+### Choose the test boundary
+
+Use unit tests for local rules, integration tests for collaboration and transport
+contracts, and end-to-end tests for complete user workflows when that is the
+uncertainty. There is no universal ratio or preferred layer simply because an AI
+agent writes the code. Keep the real components involved in the risk, replacing
+external services with controlled responses where useful. End-to-end coverage
+can expose integration failures; focused tests make edge cases and failures
+cheaper to reproduce. Do not send live Canvas writes merely to verify a patch.
+
+Derive assertions from an independent requirement or hand-checked example.
+Assert observable outputs, outgoing request contracts, and forbidden side effects.
+Scrutinize mocks that remove the interaction being tested or return only the
+shape the implementation happens to expect. A passing success substring or a
+mock assertion alone rarely establishes the whole behavior.
+
+For example, this is adapted from `TestMarkConversationsRead.test_sends_form_data`
+in `tests/tools/test_messaging.py`, the form-encoding regression for #208. It checks
+the actual tool's outgoing contract:
+
 ```python
-@pytest.fixture
-def mock_canvas_request():
-    with patch('canvas_mcp.tools.modules.make_canvas_request') as mock:
-        yield mock
-
+# get_tool_function is the registration helper in that test module.
 @pytest.mark.asyncio
-async def test_tool_success(mock_canvas_request, mock_course_id):
-    mock_canvas_request.return_value = {"id": 123, "name": "Test"}
-    result = await tool_function(course_identifier="test", ...)
-    assert "success" in result.lower() or "123" in result
+async def test_marks_conversations_read_with_canvas_form_fields():
+    with patch(
+        "canvas_mcp.tools.messaging.make_canvas_request", new_callable=AsyncMock
+    ) as request:
+        request.return_value = [{"id": 319, "workflow_state": "read"}]
+        tool = get_tool_function("mark_conversations_read")
+        result = await tool(conversation_ids=["319"])
+
+    assert result["success"] is True
+    assert request.call_count == 1
+    assert request.call_args.kwargs["use_form_data"] is True
+    assert request.call_args.kwargs["data"] == {
+        "conversation_ids[]": ["319"], "event": "mark_as_read"
+    }
 ```
 
-### What to Test
-- ✅ Successful API responses
-- ✅ API error handling (404, 401, 500)
-- ✅ Parameter validation (missing required params, invalid types)
-- ✅ Edge cases (empty lists, None values, special characters)
-- ✅ Canvas API quirks (form data requirements, pagination)
+This checks the tool-to-client boundary. Use a real client with controlled HTTP
+transport when the uncertainty is serialization, retries, pagination, or error
+classification; this mocked example does not establish those properties.
 
-See: [Issue #56](https://github.com/vishalsachdev/canvas-mcp/issues/56) for comprehensive test coverage plan.
+### Formal methods and completion gates
+
+Use Lean/TLA+ selectively for consequential state, ownership, concurrency, or
+termination invariants. Keep the source-to-model mapping and assumptions explicit,
+and pair model proofs with implementation regressions. A proved model does not
+prove the HTTP service, compiler, or every caller follows it. See `verify/` for
+scoped examples and pinned toolchain instructions.
+
+Run focused checks during iteration and the full Python suite before committing:
+`uv run python -m pytest tests/ -v -rf`. Run `npm test` and `npm run build` for
+TypeScript changes, and relevant formal checks when their implementation mapping
+changes. Keep required lint, type-checking, and CI gates; do not merge with failing
+required checks. Report what was verified and any failures, skipped coverage, or
+environment limitations. Do not weaken assertions to obtain a green run.
 
 ## Canvas API Specifics
 - Base URL from `CANVAS_API_URL` environment variable
@@ -202,10 +206,216 @@ See: [Issue #56](https://github.com/vishalsachdev/canvas-mcp/issues/56) for comp
 - [x] PR #126: `check_enrollment` capability — **merged + shipped in v1.4.0.** Deferred: REST endpoint + teacher-token-sourcing decision
 - [x] Claude Desktop Extension (`.mcpb`) — scaffolded, distributed via GitHub Releases (auto-attached on tag), README install section; shipped in v1.4.0
 - [x] Release **v1.4.0** — GitHub + PyPI + MCP Registry + hosted server + website all live
-- [ ] Backlog triage (module templates, bulk creation, page versioning)
-- [ ] Issue #106: 186 mypy errors uncovered by adding mypy to dev deps — incremental cleanup, module by module
+- [x] PR #150: self-service access-approval flow for the hosted server — merged 2026-07-01
+- [x] PR #155: `update_discussion_topic` (#154) — **merged 2026-07-04** (32152e8); #154 closed; auto-deployed to hosted
+- [x] Release **v1.5.0** (2026-07-05) — 3 new tools (93 total), fastmcp 2.x, security hardening (#156); all channels live (GitHub/PyPI/MCP Registry/hosted/site)
+- [x] Issue #159: mcp-remote proxy hangs on stale hosted session — **fixed 2026-07-09** (PR #160: `stateless_http=True`; deployed + live-verified)
+- [x] Issue #164 / PR #165: FERPA anonymization bypass (safe-endpoint short-circuit) — **fixed, merged, deployed 2026-07-21**; follow-up #166 filed
+- [x] Issue #166: anonymizer recursive identity scrub — **fixed, merged (PR #177), deployed to hosted 2026-07-29**; follow-up #179 (layer consolidation)
+- [x] **#170 Tier 1 student write tools — MERGED to main 2026-07-30 (PR #185)**, deploying with
+  v1.6.0. 10 codex rounds to clean; policy carrier is the course syllabus (page carrier deliberately
+  removed). Hosted instance verified write-free (CANVAS_ROLE=educator + STUDENT_WRITE_TOOLS unset;
+  policy recorded in internal/ops-hosted.local.md). **#170 CLOSED 2026-08-19** as completed for the
+  delivered Tier 1 work; UMich's two pilot questions (default posture; syllabus visibility) were never
+  answered and are no longer gating. Design record: `internal/issue-170-followup-draft.md`
+- [x] **#171 identity tools — MERGED (PR #183)**; #171 closed. check_enrollment now returns
+  INDETERMINATE instead of a confident false NO on permission-stripped rosters
+- [x] **#180 rubric visibility — MERGED (PR #182)**; #180 closed. Course-bookmark association +
+  never report success on an orphaned rubric
+- [x] **#179 gap-closure half — MERGED (PR #184)**: anonymization tiers (full/identity/free_text);
+  /conversations + /pages gated (live replay: 97 inbox records, 0 surviving emails); missed email
+  keys covered; anonymization-map tool fixed. **#179 CLOSED 2026-08-01** — the tool-layer call
+  consolidation shipped in PR #211 (plus a ruff TID251 ban to keep it consolidated)
+- [x] Release **v1.6.0** (2026-07-30) — **all five channels live + verified**: GitHub Release (+`.mcpb`),
+  PyPI, MCP Registry (`isLatest=True`), site (wrangler-deployed, 1.6.0 / **96 tools**), hosted Azure.
+  Behavior change in the notes: `execute_typescript` is now opt-in (#178)
+- [x] #181 `associate_rubric` never attached the rubric — **fixed + live-verified on production Canvas**
+  (PR #189); shared `rubric_association_id()` / `unconfirmed_write_warning()` guard now used by every
+  rubric write, closing a latent hole in the #180 bookmark path
+- [x] #186 ruff in CI (**first outside contribution**, @w3lld1) — `lint` is now a required check; #175 closed
+- [x] #188 `claude-review` could never pass on a fork PR (GitHub withholds secrets) — **dropped from
+  required checks**, so external contributions are mergeable again. Required: `test-enhancements` + `lint`
+- [x] #190 `create_rubric_from_csv` — documented CSV format was **wrong** (created zero rubrics); fixed
+  in #195/#196 along with `succeeded_with_errors` handling and `error_data` surfacing
+- [x] #192 `/api/quiz/v1` client routing (#193) + paginated `api_root` (#197), anonymization gate intact
+- [x] **All three zqian bugs CLOSED 2026-07-31.** **#199** was three defects with one root cause (a
+  confident negative on an unchecked premise): `login_id` assumed to be the bare campus ID (measured
+  live — UIUC stores `vishal`, email-provisioned instances store `uniqname@umich.edu`); an email-form
+  identifier rejected by the input guard before any Canvas call; and `role`'s `student` default pushed
+  to Canvas as `type[]`, hiding every other role. Adds an **AMBIGUOUS** answer for anything
+  unverifiable (PR #203). **#198** fixed + measured A/B: omitting `parent_folder_path` isn't "root",
+  Canvas creates an `unfiled` folder (PR #203). **#200** annotations (PR #201, Copilot agent)
+- [x] **#204 tool-annotation contract complete + CI-gated (PR #205)** — `destructiveHint` now follows
+  the MCP spec ("only additive updates") instead of "destructive == deletes"; `idempotentHint` set
+  everywhere and judged on **whole effect** (grade writers append a comment; page tools re-notify;
+  `delete_announcements_by_criteria` re-derives its target set). `tests/test_tool_metadata.py`
+  enumerates the live registry **with every feature flag on**, so a bare `@mcp.tool()` fails CI —
+  the default set had hidden `execute_typescript` shipping unannotated. Convention in
+  `internal/architecture.md`
+- [x] **Hosted deployment spec public (PR #206, 2026-07-31)** — `deploy/azure/` (spec + 4 placeholdered
+  templates) is canonical; corrected HTML copies emailed in-thread to UMich (zqian) + UC Irvine
+  (VC Choudhary); site callout live on canvas-mcp.illinihunt.org. Their feedback lands as edits to
+  `deploy/azure/README.md` (`internal/hosted-spec-draft/` is scratch)
+- [x] Release **v1.7.0** (2026-08-08) — all five channels live + verified. Correctness release:
+  unconfirmed-write guards (#219/#220/#221), Planner-API upcoming assignments (#222), annotation
+  contract (#204), `cryptography` CVE, anonymization consolidated to the client layer (#179)
+- [x] **Security scan remediation — MERGED (PR #251, 11 commits by boundary).** 12 findings, 11
+  fixed: host-filesystem boundary in the file tools (both high), a **measured** `/submissions/self`
+  authorization bypass via path delimiters, CSV formula injection, Registry anonymization default,
+  unauthenticated route limits, sandbox fail-closed, Canvas token at rest/in transit, AI workflow
+  least privilege. Two Codex rounds (round 1 found a P1 in my own HTTPS fix; round 2 clean).
+  **Three breaking changes now on main — next release needs a minor bump.**
+- [ ] **#157 sandbox egress is only mitigated, not closed.** `--network=none` is passed when
+  outbound is blocked *and* the allowlist is empty — but blocking auto-allowlists the Canvas host,
+  so in any working config egress falls back to the in-process Node guard, which `child_process`
+  and bundled utilities bypass while `CANVAS_API_TOKEN` is in the environment. Now warns honestly
+  instead of implying enforcement. Real fix needs an egress proxy or network namespace
+- [x] **#249 npm setup wizard retired — CLOSED (PR #257, 2026-08-10).** Deprecated the npm package
+  (name retained), removed `cli/` + orphaned `docs/workshop.html`; restored the UIUC KB-150325 token
+  link into both docs guides (it had lived only on the deleted workshop page)
+- [x] Closing-keyword guard (#231) + three bypasses closed after an independent red-team (#241).
+  Contributors run `./scripts/install-hooks.sh` once per clone
+- [x] **CI never ran the test suite (PR #247)** — the *required* `test-enhancements` check looked
+  for `tests/test_discussion_enhancements.py` (does not exist) and echoed a hand-written
+  "✅ Basic Validation Completed / PASSED". Only **363 of 1091** tests ran on a PR (`tests/security`
+  via a different workflow); **728 never ran**. Now a 3.10/3.11/3.12/3.13 matrix runs `pytest tests/`,
+  with an aggregator keeping the required job *name* (a bare matrix publishes `test (3.10)`, which
+  would leave the required check pending forever and block every PR). `publish-mcp.yml` no longer
+  swallows failures with `|| echo "No tests found"`. **This is the likely reason so many defects
+  landed green** — see the four below, each of which the suite was asserting as correct
+- [x] **#238 announcements vs discussions (PR #242)** — `include[]=announcement` is a measured no-op
+  (live A/B: identical 19 topics with and without it); `only_announcements` is the real filter and
+  *switches* scope rather than widening, so combining costs a second call. README + manifest
+  documented a **parameter that does not exist**. `list_announcements` was educator-only while
+  AGENTS.md called it shared — resolved by making it **shared** (an independent Codex run framed it
+  as a registration bug where I had framed it as a docs bug, and was right). The reporter's suggested
+  `/announcements?context_codes[]` was measured and rejected: returns 0 (default date window)
+- [x] **#233 page media (PR #246)** — `get_page_details` stripped `<img>`/`<iframe>` with a naive
+  regex, destroying media with no trace, then labelled it "Content Preview". Measured on a real page:
+  4 embedded videos → 0. Adds `extract_embedded_media()`; both lossy steps now announce themselves;
+  naive regex → `strip_html_tags` (which also drops `<script>` *contents*)
+- [x] **#234 notify_of_update (PR #245)** — measured live: Canvas's PUT returns 16 keys and none is
+  `notify_of_update`, so it can never be confirmed. Now warns instead of claiming success, with a
+  confident *no* for the two visible suppression cases (unpublished, <1min old)
+- [x] **#235 grade comments (PR #248)** — not a server default, but **our own artifacts taught it**:
+  the bulk-grading skill shipped `comment: "Graded via automated review"` and every README grading
+  example paired a comment with a grade. Also fixed: the dry run never named the comment (the
+  documented safety net hid the one irreversible side effect), and the simple path used membership
+  while the rubric path used truthiness, so `comment: None` posted
+- [x] **`/front_page` was ungated (PR #244)** — returned `last_edited_by` (display name, pronouns,
+  avatar) while `/pages/{slug}` was gated at `identity`; the tier rule matched the `pages` path
+  segment, which `front_page` lacks. **Two tests asserted the gap as correct.** Same class as #164/#179
+- [x] **#239 prompt-injection boundary — IMPLEMENTED + MERGED (PR #258, 2026-08-10).** 11 Codex
+  rounds; fencing at the tool output-formatting boundary (both forms), write-marker backstop, and
+  `write_confirmation` tokens making 4 fan-out senders two-step. ReDoS + token-DoS found and fixed
+  along the way; live-verified. **4 breaking changes → next release is a minor bump.** #239 stays
+  OPEN for 2 low-risk deferrals (course names, own profile); durability follow-up = **#262** (CI
+  guard). Full record: [[project-239-untrusted-content-boundary]]
+- [x] **#318 delete confirmation — SHIPPED (PR #330, 2026-08-29)**; **#325 `ACCESSIBILITY_CHECKERS` — SHIPPED (PR #329)**; **#315 drop 3.10 — SHIPPED (PR #331), closed**. All in **v1.12.0, staged on main, unreleased** (breaking; see CHANGELOG Breaking block)
+- [x] **PR #317** non-root sandbox — **MERGED `b4f21b4` 2026-08-30** (stdin delivery + import-regression fix pushed to the fork; CodeQL 145/146 dismissed; #157 stays open); **#336 `--read-only` shipped same day (PR #339, `5bed8d5`)**; follow-up **#338** (configurable sandbox uid)
+- [ ] **#236** OAuth2 developer-key flow (from discussion #229) — additive path only, blocked on
+  admin access to pilot a scoped key
+- [x] Release **v1.8.0** (2026-08-09) — all five channels live + verified. Security release:
+  the 11 scan fixes + 3 breaking changes (HTTPS-only, stdio-only file tools, no-overwrite
+  downloads) + #255 dependency floors/workflow least-privilege. `uv.lock` now on the release
+  checklist; `cli/package-lock.json` drift fixed
+- [x] Release **v1.9.0** (2026-08-10) — all five channels live + verified. The #258 breaking
+  changes (4 two-step fan-out senders) + provenance fencing + OSSF Scorecard/supply-chain work.
+  **First release with `.mcpb` SLSA provenance** (`gh attestation verify` passes); the
+  restructured two-job `create-release.yml` survived its first live run; no PyPI propagation race
+- [x] **#252 diagnosed (not merged as reported)**: PR #253's form-data fix measured unnecessary —
+  wire encodings equivalent; likely the pre-#220-guard permission failure on v1.6.0. Awaiting
+  zqian's retest on v1.7.0+; #253 open pending that
+- [ ] **PR #191 (Copilot) quizzes BLOCKED on correctness** — note this is a *PR* against issue
+  **#172**, not an issue itself. New Quizzes detection is `is_quiz_assignment AND external_tool`, but
+  measured live that flag marks *Classic* quizzes — the `AND` may match nothing and silently report zero
+  New Quizzes. Its test fixture hard-codes the assumption. Unblocking needs zqian's **scoping question 4**
+  (a New-Quizzes-enabled sandbox). Two more blockers: a 262-line non-mechanical conflict in
+  `assignments.py`, and a live `Fixes` line in the PR body that would auto-close #172 on merge (#172 has
+  already died this way twice). **PR #191 CLOSED 2026-08-26** as unverifiable; #172 stays open; reopen when a sandbox exists
+- [x] Daily triage routine live (`trig_011HVR6j4c5hDR2fj7k3ujxC`, 7am local) — #202 merged. **Prompt
+  patched 2026-07-31**: merging a brief closed #172, because it described another PR as `fixes #172`
+  and GitHub parses closing keywords anywhere in a merged PR body. Routine now forbids them *and*
+  greps its own output before opening the PR (#172 reopened)
+- [x] Issue #142 → FastMCP 4 / MCP SDK 2 migration complete: dependency
+  constraints and lockfile upgraded, protocol-model reads use native snake_case,
+  and CI runs with the temporary camelCase compatibility bridge disabled
+- [x] Issue #145 / PR #167: fastmcp 3.4.4 migration — **DONE 2026-07-21** (CVEs PYSEC-2026-2475/2476 resolved; dep-scan green; staging-validated then prod-deployed + live-verified; #145 closed)
+- [ ] Issue #157: `execute_typescript` sandbox hardening backlog (container-level egress, non-root user, prebuilt tsx image) — **self-hosted-only now**: tool is DISABLED on both hosted slots (`EXECUTE_TYPESCRIPT_ENABLED=false`, verified 2026-07-10); gate on re-enabling hosted code-exec
+- [ ] **Agent Plugins ([agent-plugins.org](https://agent-plugins.org)) → watch item, no owner.** Spec 1.0.0
+  landed 2026-08-06 (TSC: Amazon, Cursor, Microsoft, OpenAI, Vercel): root `plugin.json` +
+  `skills/<name>/SKILL.md` + `mcp.json`. Our `skills/` is **already conformant**, so packaging is ~2
+  files / ~30 min. **Blocked on credentials, not packaging:** the spec "defines no portable OAuth or
+  credential-reference fields", `mcp.json` `env`/`headers` are literal visible package data (only
+  `${PLUGIN_ROOT}` / `${PLUGIN_DATA}` expand), and the subprocess base environment is *client-selected*
+  — so `CANVAS_API_TOKEN` + `CANVAS_API_URL` have no delivery path and a plugin install would fail on
+  first tool call. Strictly worse than the `.mcpb` (keychain prompt) we already ship. **HTTP side does
+  not apply:** hosted instance is private (URL stays out of this repo) and per-caller `X-Canvas-Token`
+  can't live in portable headers. Audience skew too — Claude Code uses its own `.claude-plugin/plugin.json`,
+  Anthropic isn't on the TSC, and skills.sh already covers 40+ agents. Triggers to revisit: (1) a client
+  ships user-secret prompting for plugin MCP servers, or the spec adds credential refs; (2) Claude
+  clients adopt/bridge the format (both layouts use `skills/<name>/SKILL.md`, so dual-shipping is cheap);
+  (3) a user files an issue. If ever built: `cwd: "${PLUGIN_DATA}"` + a setup skill writing `.env` there
+  is the viable pattern, but needs an explicit path in `load_dotenv()` (it resolves against the calling
+  module, not CWD). Cost if adopted: a 4th version-stamp location in the release checklist
+- [ ] Backlog triage (module templates, bulk creation, page versioning — feature ideas only, no owner)
+- [x] Issue #106: mypy 229 → 0 errors + mypy in CI lint job (PR #213, 2026-08-01)
+- [x] **#275 `get_my_peer_reviews_todo` — CLOSED 2026-08-20** on khagyard's confirmation
+  ("The fix worked thank you!"). PR #288's Planner-feed discovery path is what fixed it; the
+  assignment-scoped `peer_reviews` endpoints are instructor-focused, which @aesse97 called
+  correctly in the thread. Two corrections to the old note here: the earlier claim that khagyard
+  "confirmed still not found even with the direct lookup" is **unsupported** — their report
+  predates any build containing PR #277's `assignment_identifier`, and they never answered which
+  version they were on. And the **root cause of the original discovery-scan miss was never
+  diagnosed, only routed around**. Their production payload is now the acceptance-replay fixture
+- [x] **#309 content migration — PR #316 MERGED 2026-08-20** (`ea50c711`). Two educator-only tools:
+  preview→confirm course copy + one-poll-per-call status with migration-issue review. **#309 stays
+  OPEN** for zqian's answer on `selective_import` (deliberately out of v1: a second async workflow
+  that cannot be measured without a sandbox) and for a real sandbox payload — the bracket-form
+  encoding, Progress state vocabulary, and migration-issue field names are doc-derived, not measured
+
+- [x] **#283 announcement→discussion silent fallback — two-layer fix complete (PR #285 +
+  PR #291, merged 2026-08-14).** jonespm's retest showed the deeper mechanism: Canvas answers
+  200 to a student's create_announcement, silently drops `is_announcement`, and creates a real
+  discussion topic. PR #291 adds (1) a permission pre-check — `GET /courses/:id?include[]=permissions`,
+  measured live: flags exist ONLY on the single-course endpoint (list ignores the include;
+  `/permissions` omits them); refuses only on explicit `false`, fails open otherwise — and
+  (2) cleanup: the orphaned topic is auto-deleted on downgrade detection. Two opencode rounds
+  (round 1 found a None-body TypeError on the cleanup DELETE; round 2 APPROVE). Issue stays
+  open for khagyard's student-token retest from main (their test course still has orphan topic 674). **#283 CLOSED 2026-08-26** on khagyard's confirmation
+- [x] **#281 search_canvas_tools never searched MCP tools — fixed (PR #286, merged 2026-08-13).**
+  It searched only code_api TS files (bruchris's outside diagnosis, correct). Now also
+  queries the live registry (`mcp.list_tools(run_middleware=False)`) with labeled sections;
+  **breaking: response shape v2** (`schema_version: 2`, flat `tools` key gone), shape pinned
+  by test. Follow-up #287 filed (pre-existing uncapped `full`-mode TS dumps). zqian confirmed
+  on `main` (multiple queries) — **issue CLOSED 2026-08-14**
+- [x] **#287 uncapped full-mode TS dumps — CLOSED (PR #290, merged 2026-08-14).** Second
+  outside code contribution (@SHIL0018): 2,000-char cap + regression test on the discovery
+  code-API full branch. Fork CI needed manual approve-runs; `claude-review` failed as always
+  on forks (not required). Verified the fixture can't pass vacuously (matched file is 18.8KB)
+- [x] **#270 isError + #271 double-payload — IMPLEMENTED AND MERGED 2026-08-19** (commits `2f87e13`,
+  `85b1f16`, `feae3a8`; new `src/canvas_mcp/core/tool_results.py`). Both issues CLOSED. Tool failures now
+  set MCP `isError: true`; string-returning tools no longer duplicate their value into
+  `structuredContent.result`. **Two breaking wire-shape changes sitting UNRELEASED on `main`** — see the
+  release note below
+- [x] **#262 CI fencing guard — DONE 2026-08-19** (`b9c93a5`, registry-wide read-tool fencing coverage);
+  #262 CLOSED. This was the durability follow-up named on #239, which is also CLOSED (2026-08-19) — its
+  two low-risk deferrals (course names, own profile) are documented policy choices now, re-file narrowly
+  if ever wanted
+- [x] Release **v1.11.0** (2026-08-20) — all five channels live + verified: GitHub Release
+  (`.mcpb` + SLSA, `gh attestation verify` exit 0), PyPI 200, MCP Registry `isLatest=True`,
+  site wrangler-deployed to the custom domain, hosted Azure auto-deployed (401 challenge healthy).
+  Protocol-correctness release: #303 rename (breaking), #270 `isError`, #271 double-payload,
+  fastmcp 3.4.7 floor. **Registry job failed once on a NEW failure mode** — an unauthenticated
+  `api.github.com` lookup rate-limited to `null`, surfacing as `not in gzip format`; a rerun
+  fixed it and the step is now authenticated with a null guard (`4639847`). Not the PyPI race:
+  PyPI already returned 200. Both modes and the test that distinguishes them are in the checklist
 
 ## Roadmap
+- [ ] Grok/xAI integration research and pilot — verify the current official path for third-party
+  tools, connectors, bots, or MCP servers; document registration, hosting, authentication, review,
+  and cost requirements; then test the nearest supported integration path. If Grok still has no
+  public plugin or MCP registry, record that boundary and revisit when xAI publishes one.
 - [x] Release v1.0.8 — all CI/CD pipelines passing (PyPI, MCP Registry, GitHub Release)
 - [x] Learning Designer tools & skills — `get_course_structure` tool + 3 skills (QC, accessibility, builder)
 - [x] GitHub Pages audit — 7 disconnects fixed (tool count, test count, analytics, URLs, compatibility)
@@ -223,12 +433,15 @@ See: [Issue #56](https://github.com/vishalsachdev/canvas-mcp/issues/56) for comp
 - [ ] Page templates
 - [ ] Bulk page creation from markdown files
 - [ ] Page content versioning/history tools
+- [ ] **2026-09-06 security review follow-ups** (Codex xhigh, branch `codex/review-2026-09-06` unmerged; 1 High fixed, 3 Medium + 2 Low open, 4 perf recs): plan in `docs/superpowers/plans/2026-09-06-security-review-followups.md`. First step is a PR of the branch; S1 changes HTTP-mode behaviour.
 
 ## Hosted Deployment (Azure — #115)
 
 There is a **private, Entra-gated** hosted instance for Gies course staff. It is **not shared
 publicly** — keep its endpoint URL, Entra app IDs, deploy specifics, and access-key holders out
-of this (public) repo. All operational detail lives in the **gitignored** `docs/ops-hosted.local.md`.
+of this (public) repo. All operational detail lives in the **gitignored** `internal/ops-hosted.local.md`
+(moved out of `docs/` on 2026-06-21 — that dir is the Cloudflare Pages publish root and was serving
+these local-only files publicly; `docs/.assetsignore` is now a backstop).
 
 - **Architecture (no secrets):** Azure App Service (Web App for Containers) inside the UIUC
   `urbana-business-disruptionlab` subscription, fronted by App Service Easy Auth in API/bearer
@@ -241,16 +454,39 @@ of this (public) repo. All operational detail lives in the **gitignored** `docs/
   is operator-only.
 
 ## Session Log
-> Full history: [docs/session-history.md](./docs/session-history.md)
+> Full history: `internal/session-history.md` — **local-only, untracked since 2026-08-20**
+> (it carried a paraphrase of a collaborator's private email and the private hosted endpoint
+> URL while being world-readable). Do not re-add it to git.
 
-### 2026-06-17 — mcp-remote blocker RESOLVED + app→`canvas-mcp` + branch→slot CI
-- **🏁 The `AADSTS9010010` blocker is gone — verified live.** DNS landed (CNAME + asuid), bound the private custom domain + GeoTrust managed cert to the app; PRM `resource` now == the registered App ID URI, and added that URI to Easy Auth `allowedAudiences` (RFC 8707 token `aud`). Ran `mcp-remote` end-to-end against the custom domain: token exchange + MCP session succeed. (Endpoint/IDs in gitignored `docs/ops-hosted.local.md`.) **All clients (Claude Desktop/Code, Cursor, Codex, VS Code) work.**
-- **App renamed `gies-canvas-mcp` → `canvas-mcp`** (Azure can't rename → recreated; house-consistent bare name like mindforum/uniquick/illinihunt). ITP had typo'd the CNAME to `canvas-mcp.azurewebsites.net` (no `gies-`) — instead of asking them to fix it, adopted the cleaner name (was globally available). Old `gies-canvas-mcp` + `gies-canvas-mcp-staging` apps deleted.
-- **Branch→slot CI shipped (#128, #129):** `main`→Production, `staging`→staging slot; build→push ACR→`azure/webapps-deploy`. Auth via ACR creds + publish profiles (no SP — sidesteps Owner-only RBAC). Gotcha hit + fixed: enable SCM basic-auth or deploy fails "Failed to get app runtime OS".
-- **Standardization (A/A/A):** two blessed templates — Container (canvas-mcp, illinihunt) + Code (mindforum); direct branch→slot (not swap); recorded the pattern in the `illinois-azure-container-deploy`/`cli-deploy` skills. canvas-mcp ↔ illinihunt share the container backend; mindforum is the Node-code template.
-- Also merged: **#126** `check_enrollment`; doc-synced it across AGENTS/README/manifest (tool count stayed 90 — was off-by-one).
-- **Claude Desktop Extension (`.mcpb`)** scaffolded (uv runtime; `manifest.json` + `.mcpbignore` allowlist + `scripts/build-mcpb.sh`) and **distributed via GitHub Releases** (`create-release.yml` stamps the tag version + attaches the bundle). Install tested in Claude Desktop. README "Install as a Desktop Extension" section added.
-- **Released v1.4.0** — GitHub Release + `.mcpb` + PyPI + MCP Registry + hosted server + Cloudflare website all live. (Publish-race recurred; rerun needed *after* PyPI returns 200 — memory updated.)
-- **Sanitized the public repo:** moved hosted-deployment ops (URL, Entra IDs, key-holder names) → gitignored `docs/ops-hosted.local.md`; untracked `docs/compliance/` email drafts (kept local); deleted DNS correspondence files. Repo is PUBLIC — keep the hosted endpoint out of tracked files.
-- **Outreach:** faculty onboarding doc (`docs/ops-faculty-onboarding.local.md`, hosted-only, human+agent readable). Challen reply **sent** (him only; offered demo + linked the Extension + attached setup). Mark Reynolds email **staged in Outlook** (Canvas service owner; security architecture + review ask) — needs his address before send.
-- Next: (1) **send Mark Reynolds email** (confirm address). (2) **AcrPull grant** (Adam, `docs/compliance/email-adam-acrpull-entra.txt`) → re-enable MI pull. (3) Test `.mcpb` on **Windows** (pydantic compiled-wheel risk). (4) Wire **illinihunt CI** from the documented container pattern. (5) GRC/Cybersecurity compliance emails. (`MCP_ENTRA_ALLOWED_OIDS` left open per decision — no allowlist for now.)
+> **`internal/` is deny-by-default in `.gitignore`.** Add an un-ignore only for a file
+> deliberately meant to be public. Daily triage briefs stay tracked because the routine reads
+> the newest one to compute its cutoff, so they **must not** record an external collaborator's
+> institutional affiliation, evaluation status, deployment timeline, or which competing
+> products they are weighing. Name the person and the technical issue, nothing else.
+
+### 2026-09-24 — prompt audit shipped as PR #411 + #412; injection write-gating advisory drafted (GHSA-hmr8-mvr2-mvw5)
+
+- **Prompt audit (Opus 5.5 as client model), requested via control.** `docs/audits/2026-09-23-prompt-audit.md`: 74 findings (30 High / 25 Medium / 19 Low). Not over-prompting: the defects were confident text that no longer matched the code (a seconds-vs-ms unit, publish defaults that flipped, a renamed tool, 16 parameters with no description, 2 docstring lines FastMCP drops after `Args:`). Codex (gpt-6-astra low, read-only) second-reviewed all 58 High/Medium findings: 54 confirmed, 2 dropped (T-M3, S-M7), 1 downgraded (S-M6), 13 hunks corrected; verdicts in `docs/audits/2026-09-23-codex-review.md`. `docs/audits/` is excluded from the Cloudflare upload (`docs/.assetsignore`).
+- **PR #411** (`audit/prompt-surface-2026-09-23`, worktree `../canvas-mcp-prompt-audit`): 5 commits. Four applied by Codex in a visible pane (one commit per finding group), the fifth (`ad505d5`, T-M10) makes all 14 two-call previews say "only after they approve". CI green. Registry check: 103 tools, 0 undescribed params, no schema/annotation changes. **PR #412** (`audit/untrusted-notice-wording`, worktree `../canvas-mcp-untrusted-notice`): T-M5, the inbox `UNTRUSTED_NOTICE` wording; the audit's rationale was corrected (the notice reaches only the two inbox tools). 20-run Opus 5.5 probe: 0/10 followed a planted roster-exfil injection with either wording, 5/5 quoted own text; accuracy fix only. Neither merged.
+- **Security advisory GHSA-hmr8-mvr2-mvw5 (draft, private, severity high).** A student-planted instruction can drive first-call writes: 45 write tools, 15 token-gated, 28 first-call (measured). Codex (astra high) architecture review corrected two of my claims: the confirmation token binds a request, it does not prove human approval (the assistant redeems its own token, `tests/security/test_untrusted_content.py:1054`), and blast radius is every course the token reaches. Recommended control: operator write allowlist (`core/tool_policy.py`), messaging exemption removal as second layer. Five side weaknesses (syllabus append ignores tokens; syllabus preview hides the new body; `download_course_file` mis-annotated read-only; fencing gate checks presence not coverage; token state process-local) are listed in the advisory and mirrored in gitignored `internal/security/2026-09-24-injection-write-gating.md`. Older advisory GHSA-7pp5-29mw-9jq3 (sandbox escape, high) still in triage. Classifier rejected as the wrong layer.
+- **Next:** (1) Vishal: merge #411/#412 or request changes; stdio default for the allowlist (keep behaviour vs default-deny in a major); decide GHSA-7pp5. (2) Build the advisory fix in its private fork, visible Codex pane: allowlist + `_is_single_direct_recipient` removal + side items 1 and 3, then release and publish. (3) #390 (EastArctica) still held on control's instruction. (4) Out-of-diff audit items: code-API gating on `execute_typescript` (schema-version decision), `.claude/skills` SKILL.md symlinks (local), CLAUDE.md history move. (5) `../canvas-mcp-review` (09-06 security review, 9 commits) still has no PR.
+
+## ⚠️ Adoption numbers: what is safe to publish (2026-08-21)
+
+Before quoting any adoption figure for this project in a paper, report, or institutional
+document:
+
+- **Never print a PyPI download count.** It swings by more than an order of magnitude month to
+  month — 521 (March), 7,426 (2026-08-10), 2,208 (2026-08-17). Whatever you quote will be wrong
+  within weeks and looks cherry-picked either way.
+- **Stars / forks / contributors are stable** and are the defensible numbers. Dated snapshot:
+  **194 stars / 65 forks / 19 contributors (2026-08-17)**; 198 / 67 on 2026-08-20. **Re-pull from
+  the GitHub API on the day the document is finalised** and state the date alongside.
+- **Two claims in circulation are NOT verified** and are flagged internally as author-promotion
+  statements: *"over 18,000 clones"* and *"the University of Michigan selected it as the sole
+  Canvas MCP candidate for campus deployment."* Do not repeat either without a primary source.
+
+**Institutional posture — be precise.** A private, Entra-gated hosted instance serves Gies course
+staff; the **public hosted server was retired**. The only Illinois review artifact is Adam King's
+LRA — Mark Reynolds declined to initiate a campus review on 2026-08-17. **Do not imply a campus
+security review or blessing that does not exist.**

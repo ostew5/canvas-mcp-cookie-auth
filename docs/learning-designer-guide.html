@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Learning Designer Guide - Canvas MCP</title>
-    <meta name="description" content="Learn how to use Canvas MCP as a learning designer for course design, quality assurance, accessibility compliance, and bulk course scaffolding.">
+    <meta name="description" content="Learn how to use Canvas MCP as a learning designer for course design, quality assurance, WCAG-oriented accessibility review, and bulk course scaffolding.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -41,7 +41,7 @@
                 <div class="doc-header-content">
                     <span class="doc-badge designer">🎨 Learning Designer Guide</span>
                     <h1>Canvas MCP for Learning Designers</h1>
-                    <p>AI-powered course design, quality assurance, and accessibility compliance at scale. Scaffold courses, audit content, and remediate WCAG violations.</p>
+                    <p>AI-powered course design, quality assurance, and WCAG-oriented accessibility review at scale. Scaffold courses, audit content, and remediate detected issues.</p>
                 </div>
             </div>
         </header>
@@ -75,7 +75,7 @@
                                 <p>Pre-semester audits that check module structure, content completeness, publishing state, date consistency, and naming conventions.</p>
                             </div>
                             <div class="feature-item">
-                                <h4>♿ Accessibility Compliance</h4>
+                                <h4>♿ Accessibility Review</h4>
                                 <p>Scan course content for WCAG violations, generate prioritized reports, guide remediation, and verify fixes.</p>
                             </div>
                             <div class="feature-item">
@@ -96,8 +96,8 @@
                     <section id="prerequisites">
                         <h2>Prerequisites</h2>
                         <ul>
-                            <li><strong>Python 3.10+</strong> installed on your computer</li>
-                            <li><strong>An MCP-compatible AI client</strong> &mdash; Claude Desktop, Claude Code, Cursor, ChatGPT, or others</li>
+                            <li><strong>Python 3.11+</strong> installed on your computer</li>
+                            <li><strong>An MCP client</strong> &mdash; commonly used options include Claude Desktop, Claude Code, ChatGPT, Cursor, VS Code, Zed, Windsurf, and Continue; setup and capabilities vary, so see <a href="index.html#clients">supported clients</a>.</li>
                             <li><strong>Canvas Account</strong> with designer or admin permissions</li>
                         </ul>
                     </section>
@@ -119,7 +119,7 @@ pip install -e .</code></pre>
                         <pre><code>CANVAS_API_TOKEN=your_token_here
 CANVAS_API_URL=https://canvas.youruniversity.edu</code></pre>
 
-                        <p>Add to your MCP client config:</p>
+                        <p>Add to your MCP client config &mdash; most clients read this exact entry and differ only in where the file lives:</p>
                         <pre><code>{
   "mcpServers": {
     "canvas-api": {
@@ -127,6 +127,7 @@ CANVAS_API_URL=https://canvas.youruniversity.edu</code></pre>
     }
   }
 }</code></pre>
+                        <p>The <a href="https://github.com/vishalsachdev/canvas-mcp#3-mcp-client-configuration">client configuration guide</a> lists where that file lives for Claude Desktop, Cursor, Zed, Windsurf, Continue and others &mdash; check it for your client, since some use their own schema (Zed nests the server under <code>context_servers</code>).</p>
                     </section>
 
                     <section id="available-tools">
@@ -170,13 +171,13 @@ CANVAS_API_URL=https://canvas.youruniversity.edu</code></pre>
                             <li><code>create_assignment</code> &mdash; Create assignments with due dates, points, and submission types</li>
                             <li><code>create_discussion_topic</code> &mdash; Create discussion forums</li>
                             <li><code>create_rubric</code> &mdash; Build grading rubrics</li>
-                            <li><code>associate_rubric_with_assignment</code> &mdash; Link rubrics to assignments</li>
+                            <li><code>associate_rubric</code> &mdash; Link rubrics to assignments</li>
                         </ul>
                     </section>
 
                     <section id="skills">
                         <h2>AI Skills (Automated Workflows)</h2>
-                        <p>Skills are pre-built workflows that combine multiple tools into complete processes. Available via <a href="https://skills.sh">skills.sh</a> or as Claude Code slash commands.</p>
+                        <p>Skills are pre-built workflows that combine multiple tools into complete processes. Install them into any of 40+ agents via <a href="https://skills.sh">skills.sh</a>, or use them as slash commands in Claude Code.</p>
 
                         <div class="workflow-box">
                             <h4>✅ canvas-course-qc</h4>
@@ -198,7 +199,7 @@ CANVAS_API_URL=https://canvas.youruniversity.edu</code></pre>
 
                         <div class="workflow-box">
                             <h4>♿ canvas-accessibility-auditor</h4>
-                            <p style="margin-bottom: 12px; color: var(--color-text-secondary);">WCAG compliance workflow. Scans content, generates prioritized reports, guides remediation.</p>
+                            <p style="margin-bottom: 12px; color: var(--color-text-secondary);">WCAG-oriented review workflow. Scans content, generates prioritized reports, and guides remediation.</p>
                             <p><strong>Try:</strong> <em>"Audit accessibility for BADM 350"</em></p>
                             <div class="workflow-step">
                                 <span class="step-num">1</span>
@@ -233,7 +234,7 @@ CANVAS_API_URL=https://canvas.youruniversity.edu</code></pre>
                         </div>
 
                         <h3>Installing Skills</h3>
-                        <pre><code><span class="code-comment"># Install skills for 7+ AI agents (Claude Code, Cursor, etc.)</span>
+                        <pre><code><span class="code-comment"># Interactive picker — installs into 40+ agents (Claude Code, Cursor, Codex, Zed, …)</span>
 npx skills add vishalsachdev/canvas-mcp</code></pre>
                     </section>
 

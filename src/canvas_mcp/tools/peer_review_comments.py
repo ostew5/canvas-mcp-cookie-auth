@@ -7,20 +7,68 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ..core.cache import get_course_id
 from ..core.client import make_canvas_request
+from ..core.credentials import is_http_request_active
+from ..core.csv_safety import csv_safe_cell, rows_to_csv_string
 from ..core.file_validation import sanitize_filename
 from ..core.peer_review_comments import PeerReviewCommentAnalyzer
+from ..core.untrusted_content import (
+    fence_untrusted,
+    fence_untrusted_fields,
+    fence_untrusted_inline,
+)
 from ..core.validation import validate_params
 
+# Author-controlled keys in the analyzer JSON (issue 239). Fenced only on the
+# model-facing return path — NOT on the CSV export (csv_safe_cell handles a
+# different threat) nor the on-disk JSON export (a data artifact, not context).
+_PEER_REVIEW_FENCE_FIELDS = {
+    "comment_text": "peer review comment",
+    "comment": "peer review comment",
+    "comment_preview": "peer review comment",
+    "student_name": "student name",
+    "reviewer_name": "student name",
+    "reviewee_name": "student name",
+    "assignment_name": "assignment name",
+}
 
-def register_peer_review_comment_tools(mcp: FastMCP):
+_PEER_REVIEW_CSV_HEADER = (
+    'review_id', 'reviewer_id', 'reviewer_name', 'reviewee_id', 'reviewee_name',
+    'comment_text', 'word_count', 'character_count', 'timestamp',
+)
+
+
+def _peer_review_csv_row(review: dict[str, Any]) -> list[Any]:
+    """One export row, with the student-authored columns made formula-inert.
+
+    comment_text is written by a peer and the name fields come from Canvas, so
+    all four are neutralized. The counts are computed here and stay numeric.
+    """
+    reviewer = review.get("reviewer", {})
+    reviewee = review.get("reviewee", {})
+    content = review.get("review_content", {})
+
+    return [
+        review.get("review_id", ""),
+        reviewer.get("student_id", ""),
+        csv_safe_cell(reviewer.get("student_name", "")),
+        reviewee.get("student_id", ""),
+        csv_safe_cell(reviewee.get("student_name", "")),
+        csv_safe_cell(content.get("comment_text", "")),
+        content.get("word_count", 0),
+        content.get("character_count", 0),
+        csv_safe_cell(content.get("timestamp", "")),
+    ]
+
+
+def register_peer_review_comment_tools(mcp: FastMCP) -> None:
     """Register all peer review comment analysis MCP tools."""
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_peer_review_comments(
         course_identifier: str | int,
@@ -56,12 +104,13 @@ def register_peer_review_comment_tools(mcp: FastMCP):
             if "error" in result:
                 return f"Error getting peer review comments: {result['error']}"
 
+            fence_untrusted_fields(result, _PEER_REVIEW_FENCE_FIELDS)
             return json.dumps(result, indent=2)
 
         except Exception as e:
             return f"Error in get_peer_review_comments: {str(e)}"
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def analyze_peer_review_quality(
         course_identifier: str | int,
@@ -99,12 +148,13 @@ def register_peer_review_comment_tools(mcp: FastMCP):
             if "error" in result:
                 return f"Error analyzing peer review quality: {result['error']}"
 
+            fence_untrusted_fields(result, _PEER_REVIEW_FENCE_FIELDS)
             return json.dumps(result, indent=2)
 
         except Exception as e:
             return f"Error in analyze_peer_review_quality: {str(e)}"
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def identify_problematic_peer_reviews(
         course_identifier: str | int,
@@ -139,12 +189,17 @@ def register_peer_review_comment_tools(mcp: FastMCP):
             if "error" in result:
                 return f"Error identifying problematic reviews: {result['error']}"
 
+            fence_untrusted_fields(result, _PEER_REVIEW_FENCE_FIELDS)
             return json.dumps(result, indent=2)
 
         except Exception as e:
             return f"Error in identify_problematic_peer_reviews: {str(e)}"
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    # idempotent_hint=True: the default filename is fixed (peer_reviews_<name>_<id>)
+    # and the write opens with mode "w", so a repeat overwrites the same file and
+    # converges. destructive_hint=True for the same reason: a caller-supplied
+    # filename overwrites whatever is there.
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
     @validate_params
     async def extract_peer_review_dataset(
         course_identifier: str | int,
@@ -166,6 +221,11 @@ def register_peer_review_comment_tools(mcp: FastMCP):
             save_locally: Save file locally
             filename: Custom filename
         """
+        if save_locally and is_http_request_active():
+            return (
+                "Error: Saving datasets to the server filesystem is only available "
+                "on a local (stdio) server. Set save_locally=false to return the data."
+            )
         try:
             course_id = await get_course_id(course_identifier)
             analyzer = PeerReviewCommentAnalyzer()
@@ -215,7 +275,12 @@ def register_peer_review_comment_tools(mcp: FastMCP):
                         json.dump(comments_data, f, indent=2, ensure_ascii=False)
                     return f"Data exported to {resolved}"
                 else:
-                    return json.dumps(comments_data, indent=2)
+                    # Fence only the model-facing copy — the on-disk export
+                    # above is a data artifact and stays raw.
+                    import copy
+                    fenced = copy.deepcopy(comments_data)
+                    fence_untrusted_fields(fenced, _PEER_REVIEW_FENCE_FIELDS)
+                    return json.dumps(fenced, indent=2)
 
             elif output_format.lower() == "csv":
                 output_filename = f"{filename}.csv"
@@ -227,46 +292,30 @@ def register_peer_review_comment_tools(mcp: FastMCP):
                         writer = csv.writer(f)
 
                         # Write header
-                        writer.writerow([
-                            'review_id', 'reviewer_id', 'reviewer_name', 'reviewee_id', 'reviewee_name',
-                            'comment_text', 'word_count', 'character_count', 'timestamp'
-                        ])
+                        writer.writerow(_PEER_REVIEW_CSV_HEADER)
 
                         # Write data
                         for review in comments_data.get("peer_reviews", []):
-                            reviewer = review.get("reviewer", {})
-                            reviewee = review.get("reviewee", {})
-                            content = review.get("review_content", {})
-
-                            writer.writerow([
-                                review.get("review_id", ""),
-                                reviewer.get("student_id", ""),
-                                reviewer.get("student_name", ""),
-                                reviewee.get("student_id", ""),
-                                reviewee.get("student_name", ""),
-                                content.get("comment_text", ""),
-                                content.get("word_count", 0),
-                                content.get("character_count", 0),
-                                content.get("timestamp", "")
-                            ])
+                            writer.writerow(_peer_review_csv_row(review))
 
                     return f"Data exported to {resolved}"
                 else:
-                    # Return CSV as string
-                    csv_lines = []
-                    csv_lines.append("review_id,reviewer_id,reviewer_name,reviewee_id,reviewee_name,comment_text,word_count,character_count,timestamp")
-
-                    for review in comments_data.get("peer_reviews", []):
-                        reviewer = review.get("reviewer", {})
-                        reviewee = review.get("reviewee", {})
-                        content = review.get("review_content", {})
-
-                        # Escape quotes in comment text
-                        comment_text = content.get("comment_text", "").replace('"', '""')
-
-                        csv_lines.append(f'"{review.get("review_id", "")}","{reviewer.get("student_id", "")}","{reviewer.get("student_name", "")}","{reviewee.get("student_id", "")}","{reviewee.get("student_name", "")}","{comment_text}",{content.get("word_count", 0)},{content.get("character_count", 0)},"{content.get("timestamp", "")}"')
-
-                    return "\n".join(csv_lines)
+                    # Return CSV as string. Built with the stdlib writer rather
+                    # than f-string concatenation, which mis-quotes any comment
+                    # containing a comma or a newline. This model-facing return
+                    # embeds raw names + peer comments (csv_safe_cell stops
+                    # formulas, not prompt injection), so wrap it in one
+                    # provenance fence (issue 239); the saved file above is raw.
+                    csv_string = rows_to_csv_string(
+                        _PEER_REVIEW_CSV_HEADER,
+                        (
+                            _peer_review_csv_row(review)
+                            for review in comments_data.get("peer_reviews", [])
+                        ),
+                    )
+                    return fence_untrusted(
+                        csv_string, "peer review dataset CSV (contains student names)"
+                    )
 
             else:
                 return f"Error: Unsupported output format '{output_format}'. Supported formats: csv, json"
@@ -274,7 +323,7 @@ def register_peer_review_comment_tools(mcp: FastMCP):
         except Exception as e:
             return f"Error in extract_peer_review_dataset: {str(e)}"
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def generate_peer_review_feedback_report(
         course_identifier: str | int,
@@ -352,7 +401,7 @@ def _generate_markdown_report(
     problematic_summary = problematic_data.get("flag_summary", {})
 
     report_lines = [
-        f"# Peer Review Quality Report: {assignment_name}",
+        f"# Peer Review Quality Report: {fence_untrusted_inline(assignment_name, 'assignment name')}",
         "",
         f"**Generated on:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"**Report Type:** {report_type.title()}",
@@ -407,7 +456,7 @@ def _generate_markdown_report(
                 f"- **Quality Score:** {review.get('quality_score', 0)}/5.0",
                 f"- **Word Count:** {review.get('word_count', 0)}",
                 f"- **Flag Reason:** {review.get('flag_reason', 'Unknown')}",
-                f"- **Comment Preview:** \"{review.get('comment', 'No comment')}\"",
+                f"- **Comment Preview:** {fence_untrusted_inline(review.get('comment', 'No comment'), 'peer review comment')}",
                 ""
             ])
 

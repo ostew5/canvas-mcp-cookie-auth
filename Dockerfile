@@ -1,5 +1,7 @@
-# Use Python 3.12 slim image for smaller size
-FROM python:3.12-slim
+# Use Python 3.14 slim image for smaller size.
+# Pinned by digest so the build is reproducible; Dependabot's docker
+# ecosystem entry keeps the digest current.
+FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
 
 # Set working directory
 WORKDIR /app
@@ -14,8 +16,10 @@ COPY README.md ./
 COPY env.template ./
 COPY src/ ./src/
 
-# Install dependencies using uv
-RUN uv pip install --system --no-cache -e .
+# Install dependencies using uv. The [hosted] extra (azure-data-tables,
+# azure-communication-email, azure-identity) is required by the hosted
+# access-approval flow; it is lazily imported, so stdio users are unaffected.
+RUN uv pip install --system --no-cache -e ".[hosted]"
 
 # Create non-root user for security
 RUN adduser --disabled-password --gecos '' mcp && \
@@ -26,9 +30,11 @@ RUN adduser --disabled-password --gecos '' mcp && \
 # callers supply their own token per request via the X-Canvas-Token header.
 # Code execution (execute_typescript) ships OFF by default for this network-facing
 # image; opt in with -e EXECUTE_TYPESCRIPT_ENABLED=true only behind real auth.
+# Anonymization ships ON — institutional deployments must opt OUT deliberately
+# (set -e ENABLE_DATA_ANONYMIZATION=false) after their own privacy review.
 # Example (stdio/local): docker run -e CANVAS_API_TOKEN=xyz -e CANVAS_API_URL=https://... canvas-mcp
 ENV MCP_SERVER_NAME="canvas-mcp" \
-    ENABLE_DATA_ANONYMIZATION="false" \
+    ENABLE_DATA_ANONYMIZATION="true" \
     ANONYMIZATION_DEBUG="false" \
     EXECUTE_TYPESCRIPT_ENABLED="false"
 

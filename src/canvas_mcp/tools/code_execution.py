@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ..core.config import get_config
@@ -31,6 +31,26 @@ _SAFE_ENV_KEYS = frozenset({
     "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
     "CONTAINER_HOST",
 })
+
+
+def _container_run_script(container_code_api_dir: str) -> str:
+    """Return the `sh -c` body that runs stdin-delivered code inside the container.
+
+    The script is written only to the exec-allowed $HOME tmpfs, never to the
+    host. But the tool's documented contract is that user code imports
+    `./canvas/*`, `./client` and `./index` *relative to the script*, which
+    only resolves when the script sits inside code_api/. So the run directory
+    mirrors the read-only workspace's code_api/ root with symlinks (every
+    entry, so the module root is preserved, plus `node_modules/` when the
+    operator installed it) before the script is written beside them.
+    """
+    return (
+        'mkdir -p "$HOME/run" && '
+        f'ln -s {container_code_api_dir}/* "$HOME/run/" && '
+        'if [ -d /workspace/node_modules ]; then '
+        'ln -s /workspace/node_modules "$HOME/run/node_modules"; fi && '
+        'cat > "$HOME/run/code.ts" && npx tsx "$HOME/run/code.ts"'
+    )
 
 
 def _resolve_canvas_credentials(config: Any) -> tuple[str, str]:
@@ -63,6 +83,22 @@ def _build_safe_env(config: Any) -> dict[str, str]:
     env["CANVAS_API_URL"] = canvas_api_url
     env["CANVAS_API_TOKEN"] = canvas_api_token
     return env
+
+
+def _sandbox_unavailable_error(reason: str) -> str:
+    """Refuse to execute when the requested isolation cannot be provided.
+
+    Isolation is a boundary, not a preference: if it is unavailable, the correct
+    outcome is no execution, not execution somewhere less safe.
+    """
+    log_warning(f"Refusing code execution: {reason}")
+    return (
+        f"❌ Code execution refused: {reason}\n\n"
+        "Sandboxing failed closed rather than running this code directly on the "
+        "server. Start a container runtime, fix TS_SANDBOX_CONTAINER_IMAGE, or "
+        "set TS_SANDBOX_MODE=local on a local (stdio) server where running code "
+        "on the host is the intended behavior."
+    )
 
 
 def _validate_container_image(image: str) -> bool:
@@ -270,7 +306,9 @@ def _build_local_tsx_command(temp_file_path: str) -> list[str]:
     if sys.platform != 'win32':
         return ['npx', 'tsx', temp_file_path]
 
-    node_path = shutil.which('node') or 'node'
+    # mypy evaluates sys.platform for the host OS and flags this Windows-only
+    # branch as unreachable; it is live when running on Windows.
+    node_path = shutil.which('node') or 'node'  # type: ignore[unreachable]
     tsx_cli = _find_tsx_cli_windows()
     if tsx_cli:
         return [node_path, tsx_cli, temp_file_path]
@@ -301,7 +339,7 @@ async def _runtime_available(runtime: str) -> bool:
 
     try:
         await asyncio.wait_for(process.communicate(), timeout=2)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         process.kill()
         await process.wait()
         return False
@@ -312,25 +350,45 @@ async def _runtime_available(runtime: str) -> bool:
 def register_code_execution_tools(mcp: FastMCP) -> None:
     """Register code execution MCP tools."""
 
-    @mcp.tool()
+    # Runs arbitrary caller-supplied TypeScript, which can call any Canvas
+    # endpoint the token reaches. Nothing here can be inspected ahead of time,
+    # so both hints take their most conservative value: assume it replaces data
+    # and assume repeating it does more (issue #204).
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=False))
     @validate_params
     async def execute_typescript(
         code: str,
         timeout: int = 120
     ) -> str:
-        """Execute TypeScript code in a Node.js environment with access to Canvas API.
+        """Run TypeScript (Node.js, ESM, top-level await) with Canvas API access.
 
-        IMPORTANT: This achieves 99.7% token savings for bulk operations!
-        Code runs in a sandboxed Node.js environment with Canvas API credentials,
-        all TypeScript modules in src/canvas_mcp/code_api/, and standard Node.js modules.
+        For bulk work whose per-item data should not pass through the
+        conversation. Imports, relative to the script: './canvas/<area>/<module>.js'
+        (find them with list_code_api_modules or search_canvas_tools),
+        './client.js' (canvasGet, canvasPost, canvasPut, canvasDelete,
+        canvasPutForm, fetchAllPaginated for any Canvas endpoint), and Node
+        built-ins. The client authenticates automatically.
 
-        IMPORTANT: Security is best-effort unless container sandboxing is available.
-        Code runs in a temp file (deleted after), with optional network allowlist,
-        timeout, memory, and CPU limits.
+        Only what the script prints (console.log / console.error) is returned,
+        under "=== Output ===" and "=== Errors/Warnings ===" with a success or
+        exit-code header. Return values are discarded and output is not
+        truncated, so print summaries rather than full records.
+
+        Writes (grades, comments, messages, posts) happen immediately: there is
+        no preview or confirmation_token step, and failed writes are not
+        retried. Canvas data read here is not anonymized and not marked as
+        untrusted, unlike this server's other tools.
+
+        Security is best-effort unless container sandboxing is available. In
+        local mode the code runs on the host from a temp file that is deleted
+        afterwards; in container mode it is streamed to the sandboxed process
+        and never written to host disk. An outbound network allowlist, timeout,
+        memory, and CPU limits may apply; when sandboxing is enabled the output
+        ends with a "=== Sandbox ===" section listing the mode and limits.
 
         Args:
-            code: TypeScript code to execute; can import from './canvas/*' modules.
-            timeout: Max execution time in seconds (default: 120).
+            code: TypeScript source; see imports above.
+            timeout: Max execution time in seconds (default: 120; may be capped by the server).
         """
         config = get_config()
         warnings: list[str] = []
@@ -364,6 +422,18 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
         sandbox_mode = "disabled"
         container_runtime: str | None = None
 
+        # Anything other than container mode runs the caller's TypeScript directly
+        # on the host, with the service account's environment and the Canvas token
+        # in it. That is a developer convenience on a local stdio server, where the
+        # caller already owns the machine, and a host-execution primitive on a
+        # shared HTTP one. This is checked again after mode resolution, because
+        # "auto" and a disabled sandbox both land on host execution too.
+        if is_http_request_active() and not sandbox_enabled:
+            return _sandbox_unavailable_error(
+                "Sandboxing is disabled and unsandboxed execution is not permitted "
+                "over HTTP."
+            )
+
         if sandbox_enabled:
             if block_outbound and not allowlist_hosts:
                 warnings.append(
@@ -377,10 +447,15 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
                 if not _validate_container_image(config.ts_sandbox_container_image):
                     message = (
                         f"Invalid container image format: '{config.ts_sandbox_container_image}'. "
-                        "Expected format: 'name:tag' (e.g., 'node:20-alpine'). "
-                        "Falling back to local sandbox."
+                        "Expected format: 'name:tag' (e.g., 'node:20-alpine')."
                     )
-                    warnings.append(message)
+                    if sandbox_mode_setting == "container":
+                        # Isolation was explicitly requested. Falling back to
+                        # running the caller's code directly on the host would
+                        # turn a misconfigured image name into host execution,
+                        # so refuse instead.
+                        return _sandbox_unavailable_error(message)
+                    warnings.append(f"{message} Falling back to local sandbox.")
                     log_warning(message)
                     sandbox_mode = "local"
                 else:
@@ -388,20 +463,45 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
                     if container_runtime and await _runtime_available(container_runtime):
                         sandbox_mode = "container"
                     elif sandbox_mode_setting == "container":
-                        message = (
-                            "Container sandbox requested but no runtime is available; "
-                            "falling back to local best-effort sandbox."
+                        return _sandbox_unavailable_error(
+                            "Container sandbox was requested but no container runtime "
+                            "is available."
                         )
-                        warnings.append(message)
-                        log_warning(message)
-                        sandbox_mode = "local"
                     else:
                         sandbox_mode = "local"
             else:
                 sandbox_mode = "local"
 
+            # Mode is resolved: container is the only one that confines the code.
+            if sandbox_mode != "container" and is_http_request_active():
+                return _sandbox_unavailable_error(
+                    "Container isolation is unavailable and unsandboxed execution "
+                    "is not permitted over HTTP."
+                )
+
             if block_outbound:
+                # Say plainly when the block is advisory. The guard patches
+                # net/tls/http/https and fetch inside the Node process, which
+                # executed code can step around via child_process, dgram, or a
+                # utility shipped in the image — and CANVAS_API_TOKEN is in that
+                # process's environment. Only the --network=none case above is
+                # actually enforced.
+                if sandbox_mode != "container" or allowlist_hosts:
+                    message = (
+                        "Outbound blocking is best-effort here: it is enforced by "
+                        "patching Node APIs in-process, which executed code can "
+                        "bypass (child_process, dgram, bundled utilities). Kernel-"
+                        "level enforcement applies only to container mode with an "
+                        "empty allowlist."
+                    )
+                    warnings.append(message)
+                    log_warning(message)
+
                 guard_path = _write_network_guard(allowlist_hosts, code_api_dir)
+                if sandbox_mode == "container":
+                    # 0600 only protects other host-local users, not the
+                    # container's own non-root uid on a read-only bind mount.
+                    os.chmod(guard_path, 0o644)
                 if guard_path.is_relative_to(repo_root):
                     relative_guard = guard_path.relative_to(repo_root)
                     guard_container_path = f"/workspace/{relative_guard.as_posix()}"
@@ -434,17 +534,28 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
             else:
                 node_options_container = node_options_local
 
-        # Create a temporary file for the code
+        # Container mode streams the code to the sandboxed process over stdin
+        # instead of writing it to code_api_dir first: a host-side copy of the
+        # script sits inside a traversable directory for as long as the run
+        # takes, and bulk-grading code can carry student IDs or grades in
+        # literals, so widening it to 0644 for the container uid (the
+        # previous fix) is readable by any local account on a multi-user
+        # host. Piping it in means no host-side copy ever exists.
         temp_file_path: str | None = None
-        with tempfile.NamedTemporaryFile(
-            mode='w',
-            suffix='.ts',
-            dir=code_api_dir,
-            delete=False
-        ) as temp_file:
-            # Write the user's code
-            temp_file.write(code)
-            temp_file_path = temp_file.name
+        stdin_payload: bytes | None = None
+        if sandbox_mode == "container":
+            stdin_payload = code.encode()
+        else:
+            # Create a temporary file for the code
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                suffix='.ts',
+                dir=code_api_dir,
+                delete=False
+            ) as temp_file:
+                # Write the user's code
+                temp_file.write(code)
+                temp_file_path = temp_file.name
 
         try:
             # Compute code hash for audit logging (never log raw code)
@@ -466,43 +577,92 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
                     warnings.append(message)
                     log_warning(message)
 
-            # Execute using tsx (faster than ts-node) or ts-node as fallback
-            # tsx is a fast TypeScript execution engine that doesn't require compilation
-            if sandbox_mode == "container" and container_runtime and temp_file_path:
-                relative_path = Path(temp_file_path).relative_to(repo_root)
-                container_code_path = f"/workspace/{relative_path.as_posix()}"
-
+            # Execute with tsx, which runs TypeScript without a separate build step.
+            if sandbox_mode == "container" and container_runtime:
                 cmd = [
                     container_runtime,
                     "run",
                     "--rm",
                     "-i",
+                    # Run as a fixed non-root uid:gid, not the image default
+                    # (root for node:*-alpine and most images), so a container
+                    # escape does not hand back root.
+                    "--user",
+                    config.ts_sandbox_uid_gid,
+                    # Drop all Linux capabilities and block privilege escalation;
+                    # the tsx runtime needs none of them.
+                    "--cap-drop=ALL",
+                    "--security-opt=no-new-privileges",
+                    # Cap process count to contain fork bombs.
+                    "--pids-limit=256",
+                    # Nothing needs a writable root filesystem: the workspace
+                    # is a :ro bind mount, the script arrives over stdin into
+                    # the $HOME tmpfs, npm's cache lives under $HOME and /tmp
+                    # is its own tmpfs. So the image's own filesystem is
+                    # read-only, leaving the two tmpfs mounts as the only
+                    # writable paths (and $HOME the only writable+exec one).
+                    "--read-only",
                 ]
+                # Egress: the in-process JS guard only patches net/tls/http/https
+                # and fetch, so executed code can reach the network through
+                # child_process, dgram, or a shipped binary like wget. When the
+                # operator asked for no outbound access at all, enforce it in the
+                # kernel, where nothing running inside the guest can undo it.
+                if block_outbound and not allowlist_hosts:
+                    cmd.append("--network=none")
                 if config.ts_sandbox_memory_limit_mb > 0:
                     cmd.extend(["--memory", f"{config.ts_sandbox_memory_limit_mb}m"])
                 if config.ts_sandbox_cpu_limit > 0:
                     cmd.extend(["--ulimit", f"cpu={config.ts_sandbox_cpu_limit}"])
 
                 cmd.extend([
+                    # Mount the workspace read-only so executed code cannot modify
+                    # host repo files; give it a writable tmpfs for scratch instead.
                     "-v",
-                    f"{repo_root}:/workspace",
+                    f"{repo_root}:/workspace:ro",
+                    "--tmpfs",
+                    "/tmp:rw,noexec,nosuid,size=64m",
+                    # $HOME needs to be writable and exec-allowed for npx's
+                    # tsx install step; unlike /tmp above, this one is not
+                    # noexec so a native postinstall binary (esbuild) can run.
+                    "--tmpfs",
+                    "/home/sandbox:rw,exec,nosuid,size=64m",
                     "-w",
                     "/workspace",
                     "-e",
-                    f"CANVAS_API_URL={canvas_api_url}",
+                    "HOME=/home/sandbox",
                     "-e",
-                    f"CANVAS_API_TOKEN={_canvas_api_token}",
+                    f"CANVAS_API_URL={canvas_api_url}",
+                    # Pass the Canvas token by name only so its value is taken from
+                    # this process's (filtered) environment and never appears in the
+                    # container runtime's argv (visible via ps/proc to other users).
+                    "-e",
+                    "CANVAS_API_TOKEN",
                 ])
                 if node_options_container:
                     cmd.extend(["-e", f"NODE_OPTIONS={node_options_container}"])
 
+                # The script never touches the host filesystem: it is piped
+                # over stdin, written to the exec-allowed $HOME tmpfs inside
+                # the container, and run from there (see _container_run_script
+                # for why `canvas/` is linked beside it).
+                container_code_api_dir = (
+                    "/workspace/"
+                    + code_api_dir.relative_to(repo_root).as_posix()
+                )
                 cmd.extend([
                     config.ts_sandbox_container_image,
-                    "npx",
-                    "tsx",
-                    container_code_path
+                    "sh",
+                    "-c",
+                    _container_run_script(container_code_api_dir),
                 ])
             else:
+                # Reached only when sandbox_mode != "container" (or the
+                # container runtime check above failed, which can't happen:
+                # sandbox_mode is only ever set to "container" once the
+                # runtime has already been confirmed available). Either way
+                # temp_file_path was written in the non-container branch above.
+                assert temp_file_path is not None
                 cmd = _build_local_tsx_command(temp_file_path)
 
             # Run the TypeScript code
@@ -526,6 +686,7 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
                     log_warning(message)
             process = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.PIPE if stdin_payload is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
@@ -535,7 +696,7 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
 
             try:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(),
+                    process.communicate(input=stdin_payload),
                     timeout=effective_timeout
                 )
 
@@ -587,7 +748,7 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
 
                 return "\n".join(result_lines) if result_lines else "No output"
 
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 process.kill()
                 await process.wait()
 
@@ -622,7 +783,7 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
             except Exception:
                 pass  # Ignore cleanup errors
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def list_code_api_modules() -> str:
         """List all available TypeScript modules in the code execution API.
@@ -637,13 +798,13 @@ def register_code_execution_tools(mcp: FastMCP) -> None:
 
         # Module descriptions mapping
         module_descriptions = {
-            "bulkGrade": "Grade multiple submissions with local processing function - most token-efficient method",
+            "bulkGrade": "Run a local grading function over one assignment's submissions and write the grades it returns (skips null results; supports dryRun)",
             "gradeWithRubric": "Grade a single submission with rubric criteria and optional comments",
             "bulkGradeDiscussion": "Grade discussion posts in bulk with local processing function",
             "listSubmissions": "Retrieve all submissions for an assignment (supports includeUser for names/emails)",
             "listCourses": "List all courses accessible to the current user",
             "getCourseDetails": "Get detailed information about a specific course",
-            "sendMessage": "Send a message/announcement to course participants",
+            "sendMessage": "Send a Canvas Inbox conversation to user IDs or a group code such as course_123_students; sends immediately, no preview",
             "listDiscussions": "List discussion topics in a course",
             "postEntry": "Post an entry to a discussion topic",
         }

@@ -1,74 +1,74 @@
 {
-  "collected_at": "2026-06-15T14:17:22Z",
+  "collected_at": "2026-09-21T14:07:37Z",
   "github": {
-    "stars": 145,
-    "forks": 41,
-    "contributors": 12,
-    "open_issues": 7,
-    "views_14d": 738,
-    "views_14d_unique": 361,
-    "clones_14d": 1572,
-    "clones_14d_unique": 494,
+    "stars": 257,
+    "forks": 86,
+    "contributors": 23,
+    "open_issues": 10,
+    "views_14d": 2036,
+    "views_14d_unique": 980,
+    "clones_14d": 3683,
+    "clones_14d_unique": 838,
     "referrers": [
       {
         "referrer": "Google",
-        "count": 335,
-        "uniques": 213
+        "count": 780,
+        "uniques": 540
       },
       {
         "referrer": "github.com",
-        "count": 84,
-        "uniques": 44
-      },
-      {
-        "referrer": "Bing",
-        "count": 26,
-        "uniques": 15
+        "count": 129,
+        "uniques": 76
       },
       {
         "referrer": "canvas-mcp.illinihunt.org",
-        "count": 17,
-        "uniques": 9
+        "count": 44,
+        "uniques": 31
       },
       {
-        "referrer": "statics.teams.cdn.office.net",
-        "count": 17,
-        "uniques": 2
-      },
-      {
-        "referrer": "reddit.com",
-        "count": 14,
-        "uniques": 10
-      },
-      {
-        "referrer": "DuckDuckGo",
-        "count": 5,
-        "uniques": 5
+        "referrer": "Bing",
+        "count": 34,
+        "uniques": 27
       },
       {
         "referrer": "search.brave.com",
-        "count": 5,
+        "count": 31,
+        "uniques": 16
+      },
+      {
+        "referrer": "linkedin.com",
+        "count": 29,
+        "uniques": 10
+      },
+      {
+        "referrer": "reddit.com",
+        "count": 24,
+        "uniques": 17
+      },
+      {
+        "referrer": "DuckDuckGo",
+        "count": 20,
+        "uniques": 10
+      },
+      {
+        "referrer": "teams.public.onecdn.static.microsoft",
+        "count": 15,
         "uniques": 5
       },
       {
-        "referrer": "moonshot.feishu.cn",
-        "count": 5,
-        "uniques": 1
-      },
-      {
-        "referrer": "yf2ljykclb.xfchat.iflytek.com",
-        "count": 3,
-        "uniques": 2
+        "referrer": "chatgpt.com",
+        "count": 11,
+        "uniques": 7
       }
     ]
   },
   "pypi": {
-    "last_day": 6,
-    "last_week": 102,
-    "last_month": 521
+    "last_day": 15,
+    "last_week": 239,
+    "last_month": 1254
   },
   "npm": {
-    "last_month": 68
+    "last_month": 56
   },
   "history": [
     {
@@ -205,6 +205,132 @@
       "npm_month": 68,
       "views_unique": 361,
       "clones_unique": 494
+    },
+    {
+      "date": "2026-06-22",
+      "stars": 150,
+      "forks": 42,
+      "pypi_month": 849,
+      "npm_month": 85,
+      "views_unique": 381,
+      "clones_unique": 640
+    },
+    {
+      "date": "2026-06-29",
+      "stars": 153,
+      "forks": 45,
+      "pypi_month": 849,
+      "npm_month": 76,
+      "views_unique": 378,
+      "clones_unique": 585
+    },
+    {
+      "date": "2026-07-06",
+      "stars": 154,
+      "forks": 47,
+      "pypi_month": 1185,
+      "npm_month": 74,
+      "views_unique": 385,
+      "clones_unique": 530
+    },
+    {
+      "date": "2026-07-13",
+      "stars": 158,
+      "forks": 49,
+      "pypi_month": 4682,
+      "npm_month": 74,
+      "views_unique": 396,
+      "clones_unique": 475
+    },
+    {
+      "date": "2026-07-14",
+      "stars": 161,
+      "forks": 50,
+      "pypi_month": 4682,
+      "npm_month": 71,
+      "views_unique": 404,
+      "clones_unique": 451
+    },
+    {
+      "date": "2026-07-20",
+      "stars": 165,
+      "forks": 54,
+      "pypi_month": 6740,
+      "npm_month": 73,
+      "views_unique": 409,
+      "clones_unique": 349
+    },
+    {
+      "date": "2026-07-27",
+      "stars": 171,
+      "forks": 54,
+      "pypi_month": 7021,
+      "npm_month": 65,
+      "views_unique": 359,
+      "clones_unique": 343
+    },
+    {
+      "date": "2026-08-04",
+      "stars": 177,
+      "forks": 59,
+      "pypi_month": 7426,
+      "npm_month": 72,
+      "views_unique": 439,
+      "clones_unique": 577
+    },
+    {
+      "date": "2026-08-09",
+      "stars": 181,
+      "forks": 61,
+      "pypi_month": 7426,
+      "npm_month": 76,
+      "views_unique": 557,
+      "clones_unique": 713
+    },
+    {
+      "date": "2026-08-23",
+      "stars": 201,
+      "forks": 69,
+      "pypi_month": 2353,
+      "npm_month": 114,
+      "views_unique": 791,
+      "clones_unique": 917
+    },
+    {
+      "date": "2026-08-30",
+      "stars": 209,
+      "forks": 73,
+      "pypi_month": 2308,
+      "npm_month": 110,
+      "views_unique": 947,
+      "clones_unique": 785
+    },
+    {
+      "date": "2026-09-07",
+      "stars": 231,
+      "forks": 80,
+      "pypi_month": 2218,
+      "npm_month": 114,
+      "views_unique": 1051,
+      "clones_unique": 861
+    },
+    {
+      "date": "2026-09-14",
+      "stars": 244,
+      "forks": 82,
+      "pypi_month": 1735,
+      "npm_month": 65,
+      "views_unique": 1000,
+      "clones_unique": 861
+    },
+    {
+      "date": "2026-09-21",
+      "stars": 257,
+      "forks": 86,
+      "pypi_month": 1254,
+      "npm_month": 56,
+      "views_unique": 980,
+      "clones_unique": 838
     }
   ]
 }

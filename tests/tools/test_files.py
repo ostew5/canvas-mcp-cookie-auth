@@ -68,7 +68,7 @@ def mock_file_validation():
 
 def get_tool_function(tool_name: str):
     """Get a tool function by name from the registered tools."""
-    from mcp.server.fastmcp import FastMCP
+    from fastmcp import FastMCP
 
     from canvas_mcp.tools.files import (
         register_educator_file_tools,
@@ -480,6 +480,45 @@ class TestUploadCourseFile:
         assert data.get('parent_folder_path') == "Week 1/Readings"
 
     @pytest.mark.asyncio
+    async def test_upload_without_folder_path_targets_the_root_folder(
+        self, mock_canvas_api, mock_file_validation, tmp_path
+    ):
+        """No folder_path must mean the course files ROOT, not Canvas's default.
+
+        Issue #198, reproduced live against Canvas: omitting parent_folder_path
+        does NOT place the file at the root — Canvas creates a folder literally
+        named "unfiled" and puts it there. Sending an empty string is what
+        actually targets "course files". The docstring had always claimed root,
+        so this asserts the documented behavior the code did not implement.
+        """
+        from canvas_mcp.core.file_validation import FileValidationResult
+
+        test_file = tmp_path / "syllabus.pdf"
+        test_file.write_bytes(b"content")
+
+        mock_file_validation.return_value = FileValidationResult(
+            valid=True,
+            error=None,
+            file_size=7,
+            mime_type="application/pdf",
+            sanitized_name="syllabus.pdf"
+        )
+
+        mock_canvas_api['make_canvas_request'].return_value = MOCK_UPLOAD_REQUEST_RESPONSE
+        mock_canvas_api['upload_file_to_storage'].return_value = MOCK_UPLOAD_SUCCESS_RESPONSE
+
+        upload_course_file = get_tool_function('upload_course_file')
+        result = await upload_course_file("60366", str(test_file))
+
+        assert "successfully" in result.lower()
+        data = mock_canvas_api['make_canvas_request'].call_args[1].get('data', {})
+        assert 'parent_folder_path' in data, (
+            "parent_folder_path must always be sent; omitting it makes Canvas "
+            "create an 'unfiled' folder"
+        )
+        assert data['parent_folder_path'] == ""
+
+    @pytest.mark.asyncio
     async def test_upload_invalid_on_duplicate(self, mock_canvas_api, mock_file_validation, tmp_path):
         """Test upload fails with invalid on_duplicate value."""
         from canvas_mcp.core.file_validation import FileValidationResult
@@ -713,7 +752,7 @@ class TestDownloadCourseFile:
         download_fn = get_tool_function('download_course_file')
         result = await download_fn("badm_350_120251", 12345, save_directory=str(tmp_path))
 
-        assert "Downloaded: syllabus.pdf" in result
+        assert "syllabus.pdf" in result and "Downloaded:" in result
         assert str(tmp_path) in result
         assert "application/pdf" in result
         assert "badm_350_120251" in result
@@ -734,7 +773,7 @@ class TestDownloadCourseFile:
         result = await download_fn("60366", 12345, save_directory=str(tmp_path))
 
         assert str(tmp_path) in result
-        assert "Downloaded: notes.pdf" in result
+        assert "notes.pdf" in result and "Downloaded:" in result
 
     @pytest.mark.asyncio
     async def test_download_api_error(self, mock_download_api):
@@ -814,7 +853,7 @@ class TestDownloadCourseFile:
         download_fn = get_tool_function('download_course_file')
         result = await download_fn("60366", 12345, save_directory=str(tmp_path))
 
-        assert "Downloaded: backup_name.pdf" in result
+        assert "backup_name.pdf" in result and "Downloaded:" in result
 
     @pytest.mark.asyncio
     async def test_download_http_error(self, mock_download_api, tmp_path):
@@ -917,7 +956,7 @@ class TestReadCourseFile:
         read_fn = get_tool_function('read_course_file')
         result = await read_fn("badm_350_120251", 12345)
 
-        assert "Read: syllabus.pdf" in result
+        assert "syllabus.pdf" in result and "Read:" in result
         assert "application/pdf" in result
         assert "badm_350_120251" in result
         assert "base64" in result
@@ -1010,7 +1049,7 @@ class TestReadCourseFile:
         result = await read_fn("60366", 12345, max_size_mb=0.001)
 
         # 10 bytes is within 0.001 MB (~1 KB), so should succeed
-        assert "Read: small.txt" in result
+        assert "small.txt" in result and "Read:" in result
 
     @pytest.mark.asyncio
     async def test_read_http_error(self, mock_read_api):
@@ -1058,7 +1097,7 @@ class TestReadCourseFile:
         read_fn = get_tool_function('read_course_file')
         result = await read_fn("60366", 12345)
 
-        assert "Read: backup_name.pdf" in result
+        assert "backup_name.pdf" in result and "Read:" in result
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("bad_value", [0, 0.0, -1, -25.0])
@@ -1125,7 +1164,7 @@ class TestReadCourseFile:
             read_fn = get_tool_function('read_course_file')
             result = await read_fn("60366", 12345, max_size_mb=1000.0)
 
-        assert "Read: small.txt" in result
+        assert "small.txt" in result and "Read:" in result
 
 
 class TestListCourseFiles:

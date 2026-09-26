@@ -9,6 +9,7 @@ import datetime
 from typing import Any
 
 from .client import fetch_all_paginated_results, make_canvas_request
+from .csv_safety import csv_safe_cell, rows_to_csv_string
 from .dates import parse_date
 
 
@@ -20,7 +21,7 @@ class PeerReviewAnalyzer:
 
     async def get_assignments(
         self,
-        course_id: int,
+        course_id: int | str,
         assignment_id: int,
         include_names: bool = True,
         include_submission_details: bool = False
@@ -108,7 +109,7 @@ class PeerReviewAnalyzer:
 
     async def get_completion_analytics(
         self,
-        course_id: int,
+        course_id: int | str,
         assignment_id: int,
         include_student_details: bool = True,
         group_by_status: bool = True
@@ -118,7 +119,7 @@ class PeerReviewAnalyzer:
         try:
             # Get the assignments data
             assignments_data = await self.get_assignments(
-                course_id, assignment_id, include_names=True
+                course_id, assignment_id, include_names=False
             )
 
             if "error" in assignments_data:
@@ -136,6 +137,10 @@ class PeerReviewAnalyzer:
                 return {"error": f"Failed to get users: {users_response}"}
 
             students = users_response if isinstance(users_response, list) else []
+            student_names = {
+                student.get("id"): student.get("name", "Unknown")
+                for student in students
+            }
 
             # Calculate completion statistics
             reviewer_stats = {}
@@ -148,7 +153,7 @@ class PeerReviewAnalyzer:
                 if reviewer_id not in reviewer_stats:
                     reviewer_stats[reviewer_id] = {
                         "student_id": reviewer_id,
-                        "student_name": assignment.get("reviewer_name", "Unknown"),
+                        "student_name": student_names.get(reviewer_id, "Unknown"),
                         "assigned_count": 0,
                         "completed_count": 0,
                         "pending_reviews": []
@@ -165,12 +170,14 @@ class PeerReviewAnalyzer:
                         assigned_date = parse_date(assignment["assigned_date"])
                         if assigned_date:
                             days_since_assigned = (
-                                datetime.datetime.now(datetime.timezone.utc) - assigned_date
+                                datetime.datetime.now(datetime.UTC) - assigned_date
                             ).days
 
                     reviewer_stats[reviewer_id]["pending_reviews"].append({
                         "reviewee_id": assignment["reviewee_id"],
-                        "reviewee_name": assignment.get("reviewee_name", "Unknown"),
+                        "reviewee_name": student_names.get(
+                            assignment["reviewee_id"], "Unknown"
+                        ),
                         "days_since_assigned": days_since_assigned
                     })
 
@@ -230,7 +237,7 @@ class PeerReviewAnalyzer:
 
     async def generate_report(
         self,
-        course_id: int,
+        course_id: int | str,
         assignment_id: int,
         report_format: str = "markdown",
         include_executive_summary: bool = True,
@@ -419,53 +426,51 @@ class PeerReviewAnalyzer:
         return {"report": "\n".join(report_lines)}
 
     def _generate_csv_report(self, analytics: dict[str, Any], assignment_info: dict[str, Any]) -> dict[str, str]:
-        """Generate a CSV-formatted report."""
+        """Generate a CSV-formatted report.
 
-        csv_lines = [
-            "student_id,student_name,assigned_count,completed_count,completion_rate,status,pending_reviews,priority_level"
-        ]
+        Student names come from Canvas and are user-controlled on many
+        instances, so every name-bearing column is routed through
+        ``csv_safe_cell``; the counts are computed here and stay numeric.
+        Rows go through the stdlib writer rather than f-string concatenation,
+        which mis-quotes any name containing a comma or a quote.
+        """
+
+        header = (
+            "student_id", "student_name", "assigned_count", "completed_count",
+            "completion_rate", "status", "pending_reviews", "priority_level",
+        )
 
         completion_groups = analytics.get("completion_groups", {})
 
-        # Add urgent students
-        for student in completion_groups.get("none_complete", []):
-            pending_reviews = "; ".join([
+        def pending(student: dict[str, Any]) -> str:
+            return "; ".join([
                 f"{pr['reviewee_name']} ({pr['reviewee_id']})"
                 for pr in student.get("pending_reviews", [])
             ])
-            csv_lines.append(
-                f"{student['student_id']},{student['student_name']},"
-                f"{student['assigned_count']},{student['completed_count']},"
-                f"{student['completion_rate']},none_complete,"
-                f"\"{pending_reviews}\",urgent"
-            )
 
-        # Add partial completion students
-        for student in completion_groups.get("partial_complete", []):
-            pending_reviews = "; ".join([
-                f"{pr['reviewee_name']} ({pr['reviewee_id']})"
-                for pr in student.get("pending_reviews", [])
-            ])
-            csv_lines.append(
-                f"{student['student_id']},{student['student_name']},"
-                f"{student['assigned_count']},{student['completed_count']},"
-                f"{student['completion_rate']},partial_complete,"
-                f"\"{pending_reviews}\",medium"
-            )
+        rows: list[list[Any]] = []
+        for group, status, priority in (
+            ("none_complete", "none_complete", "urgent"),
+            ("partial_complete", "partial_complete", "medium"),
+            ("all_complete", "all_complete", "low"),
+        ):
+            for student in completion_groups.get(group, []):
+                rows.append([
+                    student["student_id"],
+                    csv_safe_cell(student["student_name"]),
+                    student["assigned_count"],
+                    student["completed_count"],
+                    student["completion_rate"],
+                    status,
+                    csv_safe_cell(pending(student)) if group != "all_complete" else "",
+                    priority,
+                ])
 
-        # Add complete students
-        for student in completion_groups.get("all_complete", []):
-            csv_lines.append(
-                f"{student['student_id']},{student['student_name']},"
-                f"{student['assigned_count']},{student['completed_count']},"
-                f"{student['completion_rate']},all_complete,,low"
-            )
-
-        return {"report": "\n".join(csv_lines)}
+        return {"report": rows_to_csv_string(header, rows)}
 
     async def get_followup_list(
         self,
-        course_id: int,
+        course_id: int | str,
         assignment_id: int,
         priority_filter: str = "all",
         include_contact_info: bool = False,
@@ -494,7 +499,7 @@ class PeerReviewAnalyzer:
             days_since_assigned = days_threshold  # Default value
 
             # Process followup categories
-            followup_categories = {
+            followup_categories: dict[str, dict[str, Any]] = {
                 "urgent": {
                     "description": "Students with 0 peer reviews completed",
                     "count": len(completion_groups.get("none_complete", [])),

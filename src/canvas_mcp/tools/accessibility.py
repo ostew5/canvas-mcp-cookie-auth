@@ -9,18 +9,37 @@ import json
 import re
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ..core.cache import get_course_id
 from ..core.client import fetch_all_paginated_results, make_canvas_request
+from ..core.config import get_config
+from ..core.untrusted_content import (
+    fence_untrusted,
+    fence_untrusted_fields,
+    strip_fence_markers,
+)
 from ..core.validation import validate_params
 
 
 def register_accessibility_tools(mcp: FastMCP) -> None:
-    """Register all accessibility-related MCP tools."""
+    """Register accessibility MCP tools.
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    The built-in scanner (scan_course_content_accessibility /
+    fix_accessibility_issues) needs no Canvas add-on and is always registered.
+    The UFIXIT/UDOIT report pipeline is registered only when
+    ACCESSIBILITY_CHECKERS includes ``ufixit`` (the default) — see #325.
+    """
+    if "ufixit" in get_config().accessibility_checkers:
+        _register_ufixit_tools(mcp)
+    _register_builtin_scanner_tools(mcp)
+
+
+def _register_ufixit_tools(mcp: FastMCP) -> None:
+    """UFIXIT/UDOIT report pipeline — requires the add-on on the instance."""
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def fetch_ufixit_report(
         course_identifier: str | int,
@@ -65,16 +84,23 @@ def register_accessibility_tools(mcp: FastMCP) -> None:
         if "error" in page_response:
             return json.dumps({"error": f"Error fetching page content: {page_response['error']}"})
 
+        # The UFIXIT page title and body are authored by whoever can edit that
+        # page (issue 239) and flow into the model here. Fence them at this
+        # output boundary. This is safe for the write-back path: the fenced
+        # JSON is consumed only by parse_ufixit_violations (which strips the
+        # markers before parsing) — fix_accessibility_issues re-fetches page
+        # bodies from Canvas independently and never sees this output, so no
+        # fence can be PUT back into a live page.
         return json.dumps({
-            "page_title": page_response.get("title", "Unknown"),
+            "page_title": fence_untrusted(page_response.get("title", "Unknown"), "page title"),
             "page_url": page_url,
             "page_id": page_response.get("page_id"),
-            "body": page_response.get("body", ""),
+            "body": fence_untrusted(page_response.get("body", ""), "page body"),
             "updated_at": page_response.get("updated_at"),
             "course_id": course_id
         })
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def parse_ufixit_violations(report_json: str) -> str:
         """Parse UFIXIT report content to extract accessibility violations.
@@ -94,10 +120,20 @@ def register_accessibility_tools(mcp: FastMCP) -> None:
         if not body:
             return json.dumps({"error": "Report body is empty"})
 
+        # fetch_ufixit_report fences the body for the model; strip the marker
+        # lines before HTML parsing so extraction sees the real content.
+        body = strip_fence_markers(body)
+
         violations = _extract_violations_from_html(body)
 
-        # Generate summary statistics
+        # `location` is a raw author-controlled HTML line copied from the report
+        # body (issue 239). Fence it for the model-facing JSON only — this tool
+        # returns to the caller and is never fed into fix_accessibility_issues
+        # (which re-fetches page bodies from Canvas), so no fence reaches a
+        # write-back. type/severity/description are fixed lookups, not fenced.
+        # Fence AFTER the summary (which counts by type/severity, not location).
         summary = _generate_violation_summary(violations)
+        fence_untrusted_fields(violations, {"location": "content excerpt"})
 
         return json.dumps({
             "summary": summary,
@@ -109,7 +145,7 @@ def register_accessibility_tools(mcp: FastMCP) -> None:
             }
         })
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def format_accessibility_summary(violations_json: str) -> str:
         """Format parsed violations into a human-readable summary.
@@ -120,10 +156,10 @@ def register_accessibility_tools(mcp: FastMCP) -> None:
         try:
             data = json.loads(violations_json)
         except json.JSONDecodeError:
-            return "Error: Invalid JSON input"
+            return json.dumps({"error": "Invalid JSON input"})
 
         if "error" in data:
-            return f"Error: {data['error']}"
+            return json.dumps(data)
 
         summary = data.get("summary", {})
         violations = data.get("violations", [])
@@ -170,6 +206,9 @@ def register_accessibility_tools(mcp: FastMCP) -> None:
                 if violation.get("description"):
                     lines.append(f"**Description**: {violation['description']}")
                 if violation.get("location"):
+                    # location is already fenced by parse_ufixit_violations
+                    # (this tool's documented input), so it is emitted as-is to
+                    # avoid double-fencing (issue 239).
                     lines.append(f"**Location**: {violation['location']}")
                 if violation.get("remediation"):
                     lines.append(f"**How to Fix**: {violation['remediation']}")
@@ -180,7 +219,12 @@ def register_accessibility_tools(mcp: FastMCP) -> None:
 
         return "\n".join(lines)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+
+
+def _register_builtin_scanner_tools(mcp: FastMCP) -> None:
+    """Add-on-free scanner over Canvas page/assignment HTML."""
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def scan_course_content_accessibility(
         course_identifier: str | int,
@@ -232,13 +276,23 @@ def register_accessibility_tools(mcp: FastMCP) -> None:
         # Generate summary
         summary = _generate_violation_summary(all_issues)
 
+        # content_title and location are author-controlled (page titles /
+        # assignment names / raw HTML lines). Fence them for the model-facing
+        # JSON only — this scan's output is never consumed by
+        # fix_accessibility_issues (which re-fetches page bodies from Canvas),
+        # so no fence can reach a write-back path.
+        fence_untrusted_fields(
+            all_issues,
+            {"content_title": "content title", "location": "content excerpt"},
+        )
+
         return json.dumps({
             "summary": summary,
             "issues": all_issues,
             "scanned_types": types
         })
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
     @validate_params
     async def fix_accessibility_issues(
         course_identifier: str | int,

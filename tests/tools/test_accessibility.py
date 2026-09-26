@@ -36,7 +36,7 @@ def mock_canvas_api():
 
 def get_tool_function(tool_name: str):
     """Retrieve a registered tool function by name."""
-    from mcp.server.fastmcp import FastMCP
+    from fastmcp import FastMCP
 
     from canvas_mcp.tools.accessibility import register_accessibility_tools
 
@@ -84,8 +84,12 @@ class TestFetchUfixitReport:
         result = await fn("badm_350_120251")
         data = json.loads(result)
 
-        assert data["page_title"] == "UFIXIT"
-        assert "body" in data
+        # Title and body are provenance-fenced (issue 239); the real values
+        # are present inside the markers.
+        assert "UFIXIT" in data["page_title"]
+        assert "UNTRUSTED CANVAS CONTENT" in data["page_title"]
+        assert "Accessibility report body" in data["body"]
+        assert "UNTRUSTED CANVAS CONTENT" in data["body"]
         assert data["course_id"] == "60366"
 
     @pytest.mark.asyncio
@@ -176,7 +180,20 @@ class TestFormatAccessibilitySummary:
         fn = get_tool_function('format_accessibility_summary')
         result = await fn("bad-json")
 
-        assert "Error" in result
+        assert json.loads(result) == {"error": "Invalid JSON input"}
+
+    @pytest.mark.asyncio
+    async def test_format_summary_preserves_upstream_error(self, mock_canvas_api):
+        """Test formatting preserves a structured upstream error."""
+        error = {
+            "error": "Report body is empty",
+            "suggestion": "Fetch the UFIXIT report again",
+        }
+
+        fn = get_tool_function('format_accessibility_summary')
+        result = await fn(json.dumps(error))
+
+        assert json.loads(result) == error
 
     @pytest.mark.asyncio
     async def test_format_summary_no_violations(self, mock_canvas_api):
@@ -316,3 +333,87 @@ class TestFixAccessibilityIssues:
 
         # Should complete without error
         assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# ACCESSIBILITY_CHECKERS gate (#325)
+# ---------------------------------------------------------------------------
+
+UFIXIT_TOOLS = {"fetch_ufixit_report", "parse_ufixit_violations", "format_accessibility_summary"}
+BUILTIN_TOOLS = {"scan_course_content_accessibility", "fix_accessibility_issues"}
+
+
+def _registered_accessibility_tools() -> set[str]:
+    from fastmcp import FastMCP
+
+    from canvas_mcp.tools.accessibility import register_accessibility_tools
+
+    mcp = FastMCP("test")
+    captured: set[str] = set()
+    original_tool = mcp.tool
+
+    def capturing_tool(*args, **kwargs):
+        decorator = original_tool(*args, **kwargs)
+
+        def wrapper(fn):
+            captured.add(fn.__name__)
+            return decorator(fn)
+
+        return wrapper
+
+    mcp.tool = capturing_tool
+    register_accessibility_tools(mcp)
+    return captured
+
+
+@pytest.fixture
+def checkers_env(monkeypatch):
+    """Set ACCESSIBILITY_CHECKERS and reset the config singleton around the test."""
+    from canvas_mcp.core import config as config_module
+
+    def _set(value: str | None) -> None:
+        if value is None:
+            monkeypatch.delenv("ACCESSIBILITY_CHECKERS", raising=False)
+        else:
+            monkeypatch.setenv("ACCESSIBILITY_CHECKERS", value)
+        monkeypatch.setattr(config_module, "_config", None, raising=False)
+
+    yield _set
+    monkeypatch.setattr(config_module, "_config", None, raising=False)
+
+
+class TestAccessibilityCheckerGate:
+    """The UFIXIT pipeline only registers when a UFIXIT checker is declared.
+
+    The built-in scanner needs no Canvas add-on, so it is always registered.
+    """
+
+    def test_default_registers_everything(self, checkers_env):
+        checkers_env(None)
+        assert _registered_accessibility_tools() == UFIXIT_TOOLS | BUILTIN_TOOLS
+
+    @pytest.mark.parametrize("value", ["none", "", "  "])
+    def test_none_hides_ufixit_pipeline_keeps_builtin_scanner(self, checkers_env, value):
+        checkers_env(value)
+        assert _registered_accessibility_tools() == BUILTIN_TOOLS
+
+    @pytest.mark.parametrize("value", ["ufixit", "UDOIT", " udoit , ufixit "])
+    def test_ufixit_and_udoit_aliases_enable_pipeline(self, checkers_env, value):
+        checkers_env(value)
+        assert _registered_accessibility_tools() == UFIXIT_TOOLS | BUILTIN_TOOLS
+
+    def test_unknown_checker_is_ignored_with_warning(self, checkers_env):
+        checkers_env("ally")
+        with patch("canvas_mcp.core.config.log_warning") as warn:
+            from canvas_mcp.core.config import get_config
+
+            config = get_config()
+        assert config.accessibility_checkers == frozenset()
+        assert any("ACCESSIBILITY_CHECKERS" in str(c.args[0]) for c in warn.call_args_list)
+        assert _registered_accessibility_tools() == BUILTIN_TOOLS
+
+    def test_config_exposes_normalised_set(self, checkers_env):
+        checkers_env("UDOIT")
+        from canvas_mcp.core.config import get_config
+
+        assert get_config().accessibility_checkers == frozenset({"ufixit"})

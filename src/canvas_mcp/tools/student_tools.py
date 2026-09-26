@@ -4,21 +4,130 @@ These tools provide student-focused functionality using Canvas API "/self" endpo
 to access only the student's own data across their enrolled courses.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ..core.cache import get_course_code, get_course_id
 from ..core.client import fetch_all_paginated_results, make_canvas_request
 from ..core.dates import format_date, parse_date
+from ..core.untrusted_content import fence_untrusted_inline
 from ..core.validation import validate_params
 
 
-def register_student_tools(mcp: FastMCP):
+async def _fetch_planner_peer_reviews(
+    my_id: int, course_id: int | str | None = None
+) -> tuple[list[dict], str | None]:
+    """Discover pending peer reviews via the Planner API (#275).
+
+    The per-course discovery scan in ``get_my_peer_reviews_todo`` only checks
+    assignments whose listing carries ``peer_reviews: true`` and then reads
+    the assignment-scoped ``/peer_reviews`` endpoint — but per community
+    input on #275 (aesse97, jonespm), Canvas's own student "To Do" UI builds
+    its list from the Planner feed instead, where a pending peer review shows
+    up as an item with ``plannable_type: "assessment_request"``. That scan
+    reportedly misses reviews the Planner feed would have caught, so this is
+    queried as an *additional* source, not a replacement.
+
+    No ``start_date`` is passed: ``filter=incomplete_items`` already scopes
+    Canvas's response to pending items, and a peer review assigned weeks ago
+    and still incomplete is exactly the case #275 is about — a start-date
+    window would silently drop it (review round 1 caught this).
+
+    Field shapes are now **live-verified**: the #275 reporter (khagyard)
+    posted a real ``/planner/items`` payload from a production UIUC Canvas
+    (three ``assessment_request`` items — see the issue for the full JSON).
+    That measurement **falsified** the original field assumption, which was
+    sourced only from the canvas-lms serializer
+    (``lib/api/v1/planner_item.rb``, ``ASSESSMENT_REQUEST_FIELDS``) and the
+    Canvas Planner API docs, neither of which is a captured real response.
+    The measured ``plannable`` object for ``assessment_request`` items
+    carries exactly six keys: ``id``, ``title``, ``todo_date``,
+    ``created_at``, ``updated_at``, ``workflow_state`` — **no ``user_id``
+    and no ``assessor_id``** on this instance. (Top-level item fields:
+    ``course_id``, ``plannable_id``, ``plannable_type``, ``plannable_date``,
+    ``html_url`` — which does carry the assignment id in its path, e.g.
+    ``/courses/505/assignments/5066/submissions/2898`` — ``context_name``,
+    ``context_image``.) The observed payload also confirms
+    ``workflow_state == "completed"`` items DO still appear in the
+    ``filter=incomplete_items`` feed, so the completed-state filter below is
+    load-bearing, not defensive dead code.
+
+    Two consequences of the missing ``user_id``/``assessor_id``:
+    - ``found["user_id"]`` is frequently ``None`` on real data; the caller
+      must render that case rather than print a bare "Student None".
+    - The assessor guard below stays deliberately permissive (skip only on a
+      *positively different* assessor) rather than requiring a match,
+      because ``assessor_id`` was absent from every item in the real
+      payload — a strict requirement would silently discard every Planner
+      finding on this instance. It remains in place because some other
+      Canvas serialization or version may still include it.
+
+    No other student's name is serialized into this object on any of the
+    documented/measured sources, which is also why this endpoint needs no
+    additional anonymization gate (see
+    ``core/client.py::_endpoint_anonymization_mode`` — same self-scoped-feed
+    reasoning already applied to ``/planner/items`` by #222's
+    ``get_my_upcoming_assignments``).
+
+    Args:
+        my_id: The caller's Canvas user id, used for the assessor guard below.
+        course_id: When given, passed as Canvas's own ``context_codes[]``
+            filter so the server pre-filters; the caller must still apply a
+            client-side filter as backstop since this is not a documented
+            guarantee.
+
+    Returns (found_reviews, error). A non-``None`` error means the Planner
+    query failed; callers must still surface whatever the assignment-scoped
+    scan found rather than let this failure blank out the whole answer.
+    """
+    params: dict[str, Any] = {
+        "filter": "incomplete_items",
+        "per_page": 100,
+    }
+    if course_id is not None:
+        params["context_codes[]"] = [f"course_{course_id}"]
+
+    items = await fetch_all_paginated_results("/planner/items", params=params)
+
+    if isinstance(items, dict) and "error" in items:
+        return [], str(items["error"])
+    if not isinstance(items, list):
+        return [], None
+
+    found: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("plannable_type") != "assessment_request":
+            continue
+        plannable = item.get("plannable") or {}
+        if plannable.get("workflow_state") == "completed":
+            continue
+        # Permissive assessor guard: the assignment-scan path filters on
+        # assessor_id == my_id explicitly. The Planner feed is meant to be
+        # the caller's own to-do list, so it should already be self-scoped —
+        # but that is not documented, so only skip an item when Canvas
+        # positively names a *different* assessor. A missing/None
+        # assessor_id (undocumented field, may not always be populated) does
+        # not exclude the item.
+        item_assessor_id = plannable.get("assessor_id")
+        if item_assessor_id is not None and item_assessor_id != my_id:
+            continue
+        found.append({
+            "id": plannable.get("id") or item.get("plannable_id"),
+            "user_id": plannable.get("user_id"),
+            "_course_id": item.get("course_id"),
+            "_assignment_name": plannable.get("title") or "Unnamed Assignment",
+            "_source": "planner",
+        })
+    return found, None
+
+
+def register_student_tools(mcp: FastMCP) -> None:
     """Register student-specific MCP tools."""
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_my_upcoming_assignments(days: int = 7) -> str:
         """Get your upcoming assignments across all courses.
@@ -26,74 +135,87 @@ def register_student_tools(mcp: FastMCP):
         Args:
             days: Number of days to look ahead (default: 7)
         """
-        # Calculate the date range (use timezone-aware datetime)
-        end_date = datetime.now(timezone.utc) + timedelta(days=days)
+        if days < 1:
+            return "Error: days must be at least 1."
 
-        # Get upcoming events for the current user
-        events = await fetch_all_paginated_results(
-            "/users/self/upcoming_events",
-            params={"per_page": 100}
+        # /users/self/upcoming_events is hardcoded by Canvas to the
+        # dashboard's 7-day "Coming Up" window regardless of parameters
+        # (#222), so the Planner API is used instead: it honors an explicit
+        # start/end range and already carries per-item submission status,
+        # which also removes a per-assignment submissions/self round trip.
+        start_date = datetime.now(UTC)
+        end_date = start_date + timedelta(days=days)
+
+        items = await fetch_all_paginated_results(
+            "/planner/items",
+            params={
+                "start_date": start_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "end_date": end_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "per_page": 100,
+            },
         )
 
-        if isinstance(events, dict) and "error" in events:
-            return f"Error fetching upcoming assignments: {events['error']}"
+        if isinstance(items, dict) and "error" in items:
+            return f"Error fetching upcoming assignments: {items['error']}"
 
-        if not events:
-            return f"No assignments due in the next {days} days."
-
-        # Filter to assignments only (not calendar events)
         assignments = []
-        for event in events:
-            if event.get("type") == "assignment" or event.get("assignment"):
-                assignment_data = event.get("assignment", event)
-                due_at = assignment_data.get("due_at")
+        for item in items if isinstance(items, list) else []:
+            plannable_type = item.get("plannable_type")
+            plannable = item.get("plannable") or {}
 
-                if due_at:
-                    # Check if within our date range
-                    due_date = parse_date(due_at)
-                    if due_date and due_date <= end_date:
-                        assignments.append(assignment_data)
+            if plannable_type in ("assignment", "quiz"):
+                due_at = plannable.get("due_at") or item.get("plannable_date")
+            elif plannable_type == "discussion_topic":
+                # Graded discussions are assignments too; the planner reports
+                # them as discussion_topic but only graded ones carry due_at
+                # (ungraded to-do discussions have todo_date instead).
+                due_at = plannable.get("due_at")
+            else:
+                continue
+
+            if not due_at:
+                continue
+            due_date = parse_date(due_at)
+            if not due_date or due_date > end_date:
+                continue
+
+            submissions = item.get("submissions")
+            submitted = isinstance(submissions, dict) and bool(
+                submissions.get("submitted")
+            )
+            assignments.append({
+                "name": plannable.get("title", "Unnamed Assignment"),
+                "due_at": due_at,
+                "course_id": item.get("course_id"),
+                "submitted": submitted,
+            })
 
         if not assignments:
             return f"No assignments due in the next {days} days."
 
         # Sort by due date (use timezone-aware max for fallback)
-        assignments.sort(key=lambda x: parse_date(x.get("due_at", "")) or datetime.max.replace(tzinfo=timezone.utc))
+        assignments.sort(
+            key=lambda x: parse_date(x["due_at"]) or datetime.max.replace(tzinfo=UTC)
+        )
 
         # Format output
         output_lines = [f"Upcoming Assignments (Next {days} Days):\n"]
 
         for assignment in assignments:
-            name = assignment.get("name", "Unnamed Assignment")
-            due_at = format_date(assignment.get("due_at"))
-            course_id = assignment.get("course_id")
-
-            # Get course name
+            course_id = assignment["course_id"]
             course_display = await get_course_code(course_id) if course_id else "Unknown Course"
-
-            assignment_id = assignment.get("id")
-            if course_id and assignment_id:
-                sub = await make_canvas_request(
-                    "get",
-                    f"/courses/{course_id}/assignments/{assignment_id}/submissions/self"
-                )
-                if isinstance(sub, dict) and sub.get("submitted_at"):
-                    status = "✅ Submitted"
-                else:
-                    status = "❌ Not Submitted"
-            else:
-                status = "❌ Not Submitted"
+            status = "✅ Submitted" if assignment["submitted"] else "❌ Not Submitted"
 
             output_lines.append(
-                f"• {name}\n"
+                f"• {fence_untrusted_inline(assignment['name'], 'assignment title')}\n"
                 f"  Course: {course_display}\n"
-                f"  Due: {due_at}\n"
+                f"  Due: {format_date(assignment['due_at'])}\n"
                 f"  Status: {status}\n"
             )
 
         return "\n".join(output_lines)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_my_submission_status(course_identifier: str | int | None = None) -> str:
         """Get your submission status for assignments.
@@ -163,7 +285,7 @@ def register_student_tools(mcp: FastMCP):
                 due_at = assignment.get("due_at")
                 if due_at:
                     due_date = parse_date(due_at)
-                    if due_date and due_date < datetime.now(timezone.utc):
+                    if due_date and due_date < datetime.now(UTC):
                         missing.append((assignment, "OVERDUE"))
                     else:
                         missing.append((assignment, "NOT SUBMITTED"))
@@ -179,7 +301,7 @@ def register_student_tools(mcp: FastMCP):
                 course_name = assignment.get("_course_name", "")
 
                 output_lines.append(
-                    f"• {name}\n"
+                    f"• {fence_untrusted_inline(name, 'assignment name')}\n"
                     f"  {f'Course: {course_name}' if course_name else ''}\n"
                     f"  Due: {due_at}\n"
                     f"  Status: {status}\n"
@@ -194,14 +316,14 @@ def register_student_tools(mcp: FastMCP):
                 course_name = assignment.get("_course_name", "")
 
                 output_lines.append(
-                    f"• {name}\n"
+                    f"• {fence_untrusted_inline(name, 'assignment name')}\n"
                     f"  {f'Course: {course_name}' if course_name else ''}\n"
                     f"  Submitted: {submitted_at}\n"
                 )
 
         return "\n".join(output_lines)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     async def get_my_course_grades() -> str:
         """Get your current grades across all enrolled courses."""
         courses = await fetch_all_paginated_results(
@@ -255,7 +377,7 @@ def register_student_tools(mcp: FastMCP):
 
         return "\n".join(output_lines)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     async def get_my_todo_items() -> str:
         """Get your Canvas TODO list."""
         todos = await fetch_all_paginated_results(
@@ -282,7 +404,7 @@ def register_student_tools(mcp: FastMCP):
             course_display = await get_course_code(course_id) if course_id else "Unknown Course"
 
             output_lines.append(
-                f"• {name}\n"
+                f"• {fence_untrusted_inline(name, 'assignment or item title')}\n"
                 f"  Type: {item_type.title()}\n"
                 f"  Course: {course_display}\n"
                 f"  Due: {due_at}\n"
@@ -290,14 +412,79 @@ def register_student_tools(mcp: FastMCP):
 
         return "\n".join(output_lines)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
-    async def get_my_peer_reviews_todo(course_identifier: str | int | None = None) -> str:
-        """Get peer reviews you need to complete.
+    async def get_my_peer_reviews_todo(
+        course_identifier: str | int | None = None,
+        assignment_identifier: str | int | None = None,
+    ) -> str:
+        """Get peer reviews YOU need to complete.
 
         Args:
-            course_identifier: Course code or Canvas ID (omit for all courses)
+            course_identifier: Course code or Canvas ID (omit for all courses).
+                Required if assignment_identifier is given.
+            assignment_identifier: Canvas assignment ID to check directly, bypassing
+                the per-course discovery scan. Use this when you already know which
+                assignment has your peer review — the discovery scan only queries
+                assignments whose "peer_reviews" flag came back true on the course's
+                assignment listing, so an assignment where that flag is missing or
+                stale for any reason would otherwise be silently skipped.
         """
+        # The peer-review listing is only meaningful relative to the caller:
+        # reviews are filtered to assessor_id == the current user.
+        me = await make_canvas_request("get", "/users/self")
+        if not isinstance(me, dict) or "error" in me or not me.get("id"):
+            detail = me.get("error") if isinstance(me, dict) else me
+            return f"Error identifying current user: {detail}"
+        my_id = me["id"]
+
+        if assignment_identifier is not None:
+            if not course_identifier:
+                return (
+                    "Error: assignment_identifier requires course_identifier "
+                    "(peer reviews are looked up within a specific course)."
+                )
+            course_id = await get_course_id(course_identifier)
+
+            assignment = await make_canvas_request(
+                "get", f"/courses/{course_id}/assignments/{assignment_identifier}"
+            )
+            if not isinstance(assignment, dict) or "error" in assignment:
+                detail = assignment.get("error") if isinstance(assignment, dict) else assignment
+                return f"Error fetching assignment {assignment_identifier}: {detail}"
+
+            peer_reviews = await fetch_all_paginated_results(
+                f"/courses/{course_id}/assignments/{assignment_identifier}/peer_reviews",
+                params={"include[]": ["user"], "per_page": 100}
+            )
+            if isinstance(peer_reviews, dict) and "error" in peer_reviews:
+                return f"Error fetching peer reviews: {peer_reviews['error']}"
+
+            assignment_name = assignment.get("name", f"assignment {assignment_identifier}")
+            course_display = await get_course_code(course_id)
+            my_reviews = [
+                review for review in (peer_reviews if isinstance(peer_reviews, list) else [])
+                if review.get("assessor_id") == my_id
+                and review.get("workflow_state") != "completed"
+            ]
+
+            if not my_reviews:
+                return (
+                    f"No pending peer review found for you on "
+                    f"{fence_untrusted_inline(assignment_name, 'assignment name')} "
+                    f"({course_display})."
+                )
+
+            output_lines = ["Peer Reviews You Need to Complete:\n"]
+            for review in my_reviews:
+                output_lines.append(
+                    f"• {fence_untrusted_inline(assignment_name, 'assignment name')}\n"
+                    f"  Course: {course_display}\n"
+                    f"  Reviewing: Student {review.get('user_id')}\n"
+                    f"  Status: Incomplete\n"
+                )
+            return "\n".join(output_lines)
+
         if course_identifier:
             course_ids = [await get_course_id(course_identifier)]
         else:
@@ -312,6 +499,11 @@ def register_student_tools(mcp: FastMCP):
             course_ids = [course.get("id") for course in courses if course.get("id")]
 
         all_peer_reviews = []
+        # Endpoints that errored. "No pending reviews" is only a safe answer
+        # when every listing actually succeeded — the assignment-level
+        # peer_reviews endpoint is permission-gated on some instances, and a
+        # swallowed 401 here previously read as "you have nothing to do ✅".
+        unchecked: list[str] = []
 
         for course_id in course_ids:
             # Get assignments for this course
@@ -321,6 +513,7 @@ def register_student_tools(mcp: FastMCP):
             )
 
             if isinstance(assignments, dict) and "error" in assignments:
+                unchecked.append(f"course {course_id}: {assignments['error']}")
                 continue
 
             # Check each assignment for peer reviews
@@ -334,17 +527,85 @@ def register_student_tools(mcp: FastMCP):
                         params={"include[]": ["user"], "per_page": 100}
                     )
 
-                    if isinstance(peer_reviews, list):
-                        # Filter to reviews assigned to current user that are incomplete
-                        for review in peer_reviews:
-                            # Note: We'd need to filter by current user ID
-                            # For now, show all incomplete reviews
-                            if review.get("workflow_state") != "completed":
-                                review["_course_id"] = course_id
-                                review["_assignment_name"] = assignment.get("name")
-                                all_peer_reviews.append(review)
+                    if isinstance(peer_reviews, dict) and "error" in peer_reviews:
+                        name = assignment.get("name", f"assignment {assignment_id}")
+                        unchecked.append(
+                            f"{fence_untrusted_inline(name, 'assignment name')} "
+                            f"(course {course_id}): {peer_reviews['error']}"
+                        )
+                        continue
+
+                    for review in peer_reviews if isinstance(peer_reviews, list) else []:
+                        if (
+                            review.get("assessor_id") == my_id
+                            and review.get("workflow_state") != "completed"
+                        ):
+                            review["_course_id"] = course_id
+                            review["_assignment_name"] = assignment.get("name")
+                            review["_source"] = "assignment scan"
+                            all_peer_reviews.append(review)
+
+        # Merge in the Planner-based discovery path (#275). Union, not
+        # replacement — the assignment-scoped scan above works on some
+        # instances, and we have no way to live-verify the Planner feed
+        # against a real pending review, so neither path is dropped.
+        # Course IDs are cached/compared as strings (get_course_id's return
+        # type), but Canvas returns course_id as a JSON number on planner
+        # items — compare both sides as strings or every planner item gets
+        # silently filtered out / never dedups against the assignment scan.
+        # A single course_id is passed through to Canvas's own
+        # context_codes[] filter (server-side pre-filter); the client-side
+        # filter below stays as a backstop since that behavior isn't
+        # documented as guaranteed.
+        planner_course_id = course_ids[0] if course_identifier and len(course_ids) == 1 else None
+        planner_reviews, planner_error = await _fetch_planner_peer_reviews(
+            my_id, course_id=planner_course_id
+        )
+        if course_identifier:
+            course_id_strs = {str(c) for c in course_ids}
+            planner_reviews = [
+                r for r in planner_reviews if str(r.get("_course_id")) in course_id_strs
+            ]
+
+        # Review "id" is an AssessmentRequest id on both paths, but its type
+        # isn't guaranteed to match: the assignment-scan path gets it from
+        # the /peer_reviews endpoint (typically an int), while the Planner
+        # docs describe the top-level plannable_id as a string even though
+        # plannable.id (used here) is typically an int. Normalize with
+        # str() on both sides of the key so a type-only mismatch never
+        # produces a duplicate entry.
+        dedup_keys = {
+            (str(r.get("_course_id")), str(r.get("id")))
+            for r in all_peer_reviews
+            if r.get("id") is not None
+        }
+        for review in planner_reviews:
+            key = (str(review.get("_course_id")), str(review.get("id")))
+            if review.get("id") is not None and key in dedup_keys:
+                continue
+            all_peer_reviews.append(review)
+            if review.get("id") is not None:
+                dedup_keys.add(key)
+
+        failure_note = ""
+        if unchecked:
+            failure_note += (
+                "\n⚠️  Could not check peer reviews for:\n"
+                + "".join(f"  • {item}\n" for item in unchecked)
+                + "These assignments may still have reviews assigned to you."
+            )
+        if planner_error:
+            failure_note += (
+                "\n⚠️  Could not check the Planner feed for additional peer "
+                f"reviews: {planner_error}"
+            )
 
         if not all_peer_reviews:
+            if unchecked or planner_error:
+                return (
+                    "Could not confirm your peer-review to-do list — some "
+                    "peer-review listings failed." + failure_note
+                )
             return "You have no pending peer reviews! ✅"
 
         output_lines = ["Peer Reviews You Need to Complete:\n"]
@@ -355,13 +616,24 @@ def register_student_tools(mcp: FastMCP):
             course_display = await get_course_code(course_id) if course_id else "Unknown Course"
 
             user_id = review.get("user_id")
-            review.get("assessor_id")
-
-            output_lines.append(
-                f"• {assignment_name}\n"
-                f"  Course: {course_display}\n"
+            source = review.get("_source", "assignment scan")
+            source_label = "Planner feed" if source == "planner" else "Assignment scan"
+            # Measured live (#275, khagyard): the Planner feed's
+            # assessment_request plannable carries no user_id at all, so
+            # this must render an honest "not identified" note rather than
+            # the literal string "Student None".
+            reviewing_line = (
                 f"  Reviewing: Student {user_id}\n"
-                f"  Status: Incomplete\n"
+                if user_id is not None
+                else "  Reviewing: (reviewee not identified in Planner feed)\n"
             )
 
-        return "\n".join(output_lines)
+            output_lines.append(
+                f"• {fence_untrusted_inline(assignment_name, 'assignment name')}\n"
+                f"  Course: {course_display}\n"
+                f"{reviewing_line}"
+                f"  Status: Incomplete\n"
+                f"  Source: {source_label}\n"
+            )
+
+        return "\n".join(output_lines) + failure_note

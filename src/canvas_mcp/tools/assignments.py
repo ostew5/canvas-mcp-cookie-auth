@@ -5,22 +5,37 @@ import datetime
 from statistics import StatisticsError, mean, median, stdev
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from ..core.anonymization import anonymize_response_data
 from ..core.cache import get_course_code, get_course_id
 from ..core.client import fetch_all_paginated_results, make_canvas_request
 from ..core.dates import format_date, parse_date
-from ..core.logging import log_error
+from ..core.untrusted_content import (
+    FENCE_LEAK_ERROR,
+    contains_fence_markers,
+    fence_untrusted,
+    fence_untrusted_inline,
+)
 from ..core.validation import validate_params
-from .rubrics import build_rubric_assessment_form_data
+from ..core.write_confirmation import (
+    ConfirmationGuard,
+    preview_with_token,
+    redeem_confirmation,
+)
+from .rubrics import (
+    RUBRIC_GRADE_UNCONFIRMED,
+    build_rubric_assessment_form_data,
+    rubric_grade_is_confirmed,
+)
+
+_DELETE_ASSIGNMENT_GUARD = ConfirmationGuard(nothing_done="Nothing was deleted.")
 
 
-def register_shared_assignment_tools(mcp: FastMCP):
+def register_shared_assignment_tools(mcp: FastMCP) -> None:
     """Register assignment tools accessible to both students and educators."""
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def list_assignments(course_identifier: str | int) -> str:
         """List assignments for a specific course.
@@ -50,15 +65,18 @@ def register_shared_assignment_tools(mcp: FastMCP):
             due_at = assignment.get("due_at", "No due date")
             points = assignment.get("points_possible", 0)
 
+            # Assignment names are instructor-authored free text (issue 239).
             assignments_info.append(
-                f"ID: {assignment_id}\nName: {name}\nDue: {due_at}\nPoints: {points}\n"
+                f"ID: {assignment_id}\n"
+                f"Name: {fence_untrusted_inline(name, 'assignment name')}\n"
+                f"Due: {due_at}\nPoints: {points}\n"
             )
 
         # Try to get the course code for display
         course_display = await get_course_code(course_id) or course_identifier
         return f"Assignments for Course {course_display}:\n\n" + "\n".join(assignments_info)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_assignment_details(course_identifier: str | int, assignment_id: str | int) -> str:
         """Get detailed information about a specific assignment.
@@ -79,9 +97,12 @@ def register_shared_assignment_tools(mcp: FastMCP):
         if "error" in response:
             return f"Error fetching assignment details: {response['error']}"
 
+        # Name and description are author-controlled; the description is full
+        # HTML that can carry paragraphs of injected directives (issue 239).
         details = [
-            f"Name: {response.get('name', 'N/A')}",
-            f"Description: {response.get('description', 'N/A')}",
+            f"Name: {fence_untrusted_inline(response.get('name', 'N/A'), 'assignment name')}",
+            "Description:\n"
+            + fence_untrusted(response.get('description') or 'N/A', 'assignment description'),
             f"Due Date: {format_date(response.get('due_at'))}",
             f"Points Possible: {response.get('points_possible', 'N/A')}",
             f"Submission Types: {', '.join(response.get('submission_types', ['N/A']))}",
@@ -94,10 +115,10 @@ def register_shared_assignment_tools(mcp: FastMCP):
         return f"Assignment Details for ID {assignment_id} in course {course_display}:\n\n" + "\n".join(details)
 
 
-def register_educator_assignment_tools(mcp: FastMCP):
+def register_educator_assignment_tools(mcp: FastMCP) -> None:
     """Register educator-only assignment tools (grading, analytics, management)."""
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=False, idempotent_hint=False))
     @validate_params
     async def assign_peer_review(course_identifier: str, assignment_id: str, reviewer_id: str, reviewee_id: str) -> str:
         """Manually assign a peer review to a student for a specific assignment.
@@ -174,7 +195,7 @@ def register_educator_assignment_tools(mcp: FastMCP):
                f"Reviewee ID: {reviewee_id}\n" + \
                f"Submission ID: {submission_id}"
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def list_peer_reviews(course_identifier: str, assignment_id: str) -> str:
         """List all peer review assignments for a specific assignment.
@@ -197,17 +218,8 @@ def register_educator_assignment_tools(mcp: FastMCP):
         if not submissions:
             return f"No submissions found for assignment {assignment_id}."
 
-        # Anonymize submission data to protect student privacy
-        try:
-            submissions = anonymize_response_data(submissions, data_type="submissions")
-        except Exception as e:
-            log_error(
-                "Failed to anonymize submission data in peer reviews",
-                exc=e,
-                course_id=course_id,
-                assignment_id=assignment_id
-            )
-            # Continue with original data for functionality
+        # Anonymization happens at the client layer (core/client.py) per
+        # ENABLE_DATA_ANONYMIZATION (#179)
 
         # Get all users in the course for name lookups
         users = await fetch_all_paginated_results(
@@ -217,18 +229,6 @@ def register_educator_assignment_tools(mcp: FastMCP):
 
         if isinstance(users, dict) and "error" in users:
             return f"Error fetching users: {users['error']}"
-
-        # Anonymize user data to protect student privacy
-        try:
-            users = anonymize_response_data(users, data_type="users")
-        except Exception as e:
-            log_error(
-                "Failed to anonymize user data in peer reviews",
-                exc=e,
-                course_id=course_id,
-                assignment_id=assignment_id
-            )
-            # Continue with original data for functionality
 
         # Create a mapping of user IDs to names
         user_map = {}
@@ -275,7 +275,10 @@ def register_educator_assignment_tools(mcp: FastMCP):
             reviewee_id = data["user_id"]
             reviews = data["peer_reviews"]
 
-            output += f"Reviews for {reviewee_name} (ID: {reviewee_id}):\n"
+            output += (
+                f"Reviews for {fence_untrusted_inline(reviewee_name, 'student name')} "
+                f"(ID: {reviewee_id}):\n"
+            )
 
             if not reviews:
                 output += "  No peer reviews assigned.\n\n"
@@ -286,7 +289,7 @@ def register_educator_assignment_tools(mcp: FastMCP):
                 reviewer_name = user_map.get(reviewer_id, f"User {reviewer_id}")
                 workflow_state = review.get("workflow_state", "Unknown")
 
-                output += f"  Reviewer: {reviewer_name} (ID: {reviewer_id})\n"
+                output += f"  Reviewer: {fence_untrusted_inline(reviewer_name, 'student name')} (ID: {reviewer_id})\n"
                 output += f"  Status: {workflow_state}\n"
 
                 # Add assessment details if available
@@ -300,10 +303,15 @@ def register_educator_assignment_tools(mcp: FastMCP):
 
         return output
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def list_submissions(course_identifier: str | int, assignment_id: str | int) -> str:
-        """List submissions for a specific assignment.
+        """List every submission record for one assignment.
+
+        Returns one record per student (user ID, submitted-at time, score,
+        grade), including students who have not submitted. Does not return
+        submission content, attachments, or comments; use
+        get_rubric_assessment for a student's rubric scores.
 
         Args:
             course_identifier: Course code or Canvas ID
@@ -328,17 +336,8 @@ def register_educator_assignment_tools(mcp: FastMCP):
         if not submissions:
             return f"No submissions found for assignment {assignment_id}."
 
-        # Anonymize submission data to protect student privacy
-        try:
-            submissions = anonymize_response_data(submissions, data_type="submissions")
-        except Exception as e:
-            log_error(
-                "Failed to anonymize submission data",
-                exc=e,
-                course_id=course_id,
-                assignment_id=assignment_id
-            )
-            # Continue with original data for functionality
+        # Anonymization happens at the client layer (core/client.py) per
+        # ENABLE_DATA_ANONYMIZATION (#179)
 
         submissions_info = []
         for submission in submissions:
@@ -355,7 +354,7 @@ def register_educator_assignment_tools(mcp: FastMCP):
         course_display = await get_course_code(course_id) or course_identifier
         return f"Submissions for Assignment {assignment_id} in course {course_display}:\n\n" + "\n".join(submissions_info)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_assignment_analytics(course_identifier: str | int, assignment_id: str | int) -> str:
         """Get detailed analytics about student performance on a specific assignment.
@@ -393,17 +392,8 @@ def register_educator_assignment_tools(mcp: FastMCP):
         if not students:
             return f"No students found for course {course_identifier}."
 
-        # Anonymize student data to protect privacy
-        try:
-            students = anonymize_response_data(students, data_type="users")
-        except Exception as e:
-            log_error(
-                "Failed to anonymize student data in analytics",
-                exc=e,
-                course_id=course_id,
-                assignment_id=assignment_id
-            )
-            # Continue with original data for functionality
+        # Anonymization happens at the client layer (core/client.py) per
+        # ENABLE_DATA_ANONYMIZATION (#179)
 
         # Get submissions for this assignment
         submissions = await fetch_all_paginated_results(
@@ -413,18 +403,6 @@ def register_educator_assignment_tools(mcp: FastMCP):
 
         if isinstance(submissions, dict) and "error" in submissions:
             return f"Error fetching submissions: {submissions['error']}"
-
-        # Anonymize submission data to protect student privacy
-        try:
-            submissions = anonymize_response_data(submissions, data_type="submissions")
-        except Exception as e:
-            log_error(
-                "Failed to anonymize submission data in analytics",
-                exc=e,
-                course_id=course_id,
-                assignment_id=assignment_id
-            )
-            # Continue with original data for functionality
 
         # Extract assignment details
         assignment_name = assignment.get("name", "Unknown Assignment")
@@ -438,7 +416,7 @@ def register_educator_assignment_tools(mcp: FastMCP):
             due_date_obj = parse_date(due_date)
             if due_date_obj:
                 due_date_str = format_date(due_date)
-                now = datetime.datetime.now(datetime.timezone.utc)
+                now = datetime.datetime.now(datetime.UTC)
                 is_past_due = due_date_obj < now
             else:
                 due_date_str = due_date
@@ -447,7 +425,7 @@ def register_educator_assignment_tools(mcp: FastMCP):
             is_past_due = False
 
         # Process submissions
-        submission_stats = {
+        submission_stats: dict[str, Any] = {
             "total_students": len(students),
             "submitted_count": 0,
             "missing_count": 0,
@@ -574,7 +552,11 @@ def register_educator_assignment_tools(mcp: FastMCP):
 
         # Format the output
         course_display = await get_course_code(course_id) or course_identifier
-        output = f"Assignment Analytics for '{assignment_name}' in Course {course_display}\n\n"
+        output = (
+            "Assignment Analytics for "
+            f"{fence_untrusted_inline(assignment_name, 'assignment name')} "
+            f"in Course {course_display}\n\n"
+        )
 
         # Assignment details
         output += "Assignment Details:\n"
@@ -615,28 +597,29 @@ def register_educator_assignment_tools(mcp: FastMCP):
             output += f"  Standard Deviation: {round(std_dev, 2)}\n"
 
             # High/Low scores
+            # Student display names are author-controlled (issue 239).
             if low_scoring_students:
                 output += "\nStudents Scoring Below 70%:\n"
                 for name, score, percentage in sorted(low_scoring_students, key=lambda x: x[2]):
-                    output += f"  {name}: {round(score, 1)}/{points_possible} ({round(percentage, 1)}%)\n"
+                    output += f"  {fence_untrusted_inline(name, 'student name')}: {round(score, 1)}/{points_possible} ({round(percentage, 1)}%)\n"
 
             if high_scoring_students:
                 output += "\nStudents Scoring Above 90%:\n"
                 for name, score, percentage in sorted(high_scoring_students, key=lambda x: x[2], reverse=True):
-                    output += f"  {name}: {round(score, 1)}/{points_possible} ({round(percentage, 1)}%)\n"
+                    output += f"  {fence_untrusted_inline(name, 'student name')}: {round(score, 1)}/{points_possible} ({round(percentage, 1)}%)\n"
 
         # Missing students
         if missing_students:
             output += "\nStudents Missing Submission:\n"
             # Sort alphabetically and show first 10
             for name in sorted(missing_students)[:10]:
-                output += f"  {name}\n"
+                output += f"  {fence_untrusted_inline(name, 'student name')}\n"
             if len(missing_students) > 10:
                 output += f"  ...and {len(missing_students) - 10} more\n"
 
         return output
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=False, idempotent_hint=False))
     @validate_params
     async def create_assignment(
         course_identifier: str | int,
@@ -672,6 +655,13 @@ def register_educator_assignment_tools(mcp: FastMCP):
             automatic_peer_reviews: Auto-assign peer reviews
             allowed_extensions: Comma-separated file extensions (e.g., "pdf,docx,txt")
         """
+        # Backstop for issue 239: a fenced read result (read→clone) must not
+        # publish our provenance markers into live Canvas.
+        if contains_fence_markers(name) or (
+            description is not None and contains_fence_markers(description)
+        ):
+            return FENCE_LEAK_ERROR
+
         course_id = await get_course_id(course_identifier)
 
         # Validate grading_type if provided
@@ -787,7 +777,7 @@ def register_educator_assignment_tools(mcp: FastMCP):
 
         return result
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
     @validate_params
     async def update_assignment(
         course_identifier: str | int,
@@ -825,10 +815,16 @@ def register_educator_assignment_tools(mcp: FastMCP):
             automatic_peer_reviews: Auto-assign peer reviews
             allowed_extensions: Comma-separated file extensions (e.g., "pdf,docx,txt")
         """
+        # Backstop for issue 239: never publish our provenance markers.
+        if (name is not None and contains_fence_markers(name)) or (
+            description is not None and contains_fence_markers(description)
+        ):
+            return FENCE_LEAK_ERROR
+
         course_id = await get_course_id(course_identifier)
 
         # Build assignment data - only include fields that are provided
-        assignment_data = {}
+        assignment_data: dict[str, Any] = {}
 
         if name is not None:
             assignment_data["name"] = name
@@ -946,7 +942,85 @@ def register_educator_assignment_tools(mcp: FastMCP):
 
         return result
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
+    @validate_params
+    async def delete_assignment_with_confirmation(
+        course_identifier: str | int,
+        assignment_id: str | int,
+        require_name_match: str | None = None,
+        confirmation_token: str | None = None
+    ) -> str:
+        """Delete an assignment. Two-step: preview first, then confirm with the token.
+
+        Permanent: removes the assignment together with every submission and grade
+        attached to it. Canvas may retain a recycle-bin copy depending on admin settings.
+
+        Args:
+            course_identifier: Course code or Canvas ID
+            assignment_id: Assignment ID to delete
+            require_name_match: Only delete if the assignment name matches this string exactly
+            confirmation_token: Token from the preview call; omit to preview
+        """
+        course_id = await get_course_id(course_identifier)
+
+        assignment = await make_canvas_request(
+            "get", f"/courses/{course_id}/assignments/{assignment_id}"
+        )
+        if "error" in assignment:
+            return f"Error fetching assignment details: {assignment['error']}"
+
+        name = assignment.get("name", "Unknown")
+        shown_name = fence_untrusted_inline(name, "assignment name")
+        if require_name_match is not None and name != require_name_match:
+            return (
+                f"❌ Name mismatch — deletion aborted.\n\n"
+                f"  Expected: {require_name_match}\n"
+                f"  Actual:   {shown_name}"
+            )
+
+        has_submissions = bool(assignment.get("has_submitted_submissions"))
+        needs_grading = assignment.get("needs_grading_count")
+        course_display = await get_course_code(course_id) or course_identifier
+        # Everything the preview shows to identify the target is bound, so a
+        # due-date or points edit between preview and confirm stops matching.
+        fingerprint = _DELETE_ASSIGNMENT_GUARD.fingerprint(
+            "delete_assignment_with_confirmation", str(course_id), str(assignment_id),
+            name, str(assignment.get("due_at")), str(assignment.get("points_possible")),
+            str(has_submissions), str(needs_grading),
+        )
+        if not confirmation_token:
+            preview = (
+                f"Would delete assignment **{shown_name}** from course {course_display}\n"
+                f"  Assignment ID: {assignment_id}\n"
+                f"  Due: {format_date(assignment.get('due_at'))}\n"
+                f"  Points: {assignment.get('points_possible')}\n"
+                f"  Submissions: {'yes' if has_submissions else 'none'}"
+                f"{f', needs grading: {needs_grading}' if needs_grading is not None else ''}\n"
+                "  ⚠️  Deleting an assignment also deletes all of its submissions and grades."
+            )
+            return preview_with_token(
+                _DELETE_ASSIGNMENT_GUARD, fingerprint,
+                "delete_assignment_with_confirmation", preview,
+            )
+        error = redeem_confirmation(_DELETE_ASSIGNMENT_GUARD, confirmation_token, fingerprint)
+        if error:
+            return error
+
+        response = await make_canvas_request(
+            "delete", f"/courses/{course_id}/assignments/{assignment_id}"
+        )
+        if "error" in response:
+            return f"Error deleting assignment {shown_name}: {response['error']}"
+
+        return (
+            f"✅ Assignment deleted successfully!\n\n"
+            f"  **{shown_name}**\n"
+            f"  Course: {course_display}\n"
+            f"  Assignment ID: {assignment_id}\n"
+            f"  Status: deleted (submissions and grades removed with it)"
+        )
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=False))
     @validate_params
     async def bulk_grade_submissions(
         course_identifier: str | int,
@@ -963,7 +1037,13 @@ def register_educator_assignment_tools(mcp: FastMCP):
         Args:
             course_identifier: Course code or Canvas ID
             assignment_id: Canvas assignment ID
-            grades: Dict mapping user_id to {rubric_assessment?, grade?, comment?}
+            grades: Dict mapping user_id to {rubric_assessment?, grade?, comment?}.
+                OMIT `comment` unless the instructor explicitly asked for written
+                feedback. "Assign grade 8" means the grade ONLY. A comment is
+                visible to the student in SpeedGrader, APPENDS a new comment on
+                every call rather than replacing the previous one, and cannot be
+                un-sent. Never generate a comment that merely restates the grade
+                or narrates that grading happened.
             dry_run: If True, validate without submitting (default: False)
             max_concurrent: Max concurrent grading operations (default: 5)
             rate_limit_delay: Delay between batches in seconds (default: 1.0)
@@ -985,21 +1065,23 @@ def register_educator_assignment_tools(mcp: FastMCP):
             assignment_check = await make_canvas_request(
                 "get",
                 f"/courses/{course_id}/assignments/{assignment_id_str}",
-                params={"include[]": ["rubric_settings"]}
+                params={"include[]": ["rubric", "rubric_settings"]}
             )
 
-            if "error" not in assignment_check:
-                use_rubric_for_grading = assignment_check.get("use_rubric_for_grading", False)
-                if not use_rubric_for_grading and not dry_run:
-                    return (
-                        "⚠️  ERROR: Rubric is not configured for grading!\n\n"
-                        "The rubric exists but 'use_for_grading' is set to FALSE.\n"
-                        "Grades will NOT be saved to the gradebook.\n\n"
-                        "To fix this:\n"
-                        "1. Use get_rubric to verify rubric settings\n"
-                        "2. Use associate_rubric with use_for_grading=True\n"
-                        "3. Or set dry_run=True to test without submitting\n"
-                    )
+            if "error" in assignment_check:
+                return "Error: Could not verify rubric grading settings; no assessments were submitted."
+
+            use_rubric_for_grading = assignment_check.get("use_rubric_for_grading") is True
+            if not use_rubric_for_grading:
+                return (
+                    "⚠️  ERROR: Rubric is not configured for grading!\n\n"
+                    "The rubric exists but 'use_for_grading' is set to FALSE.\n"
+                    "Grades will NOT be saved to the gradebook.\n\n"
+                    "To fix this:\n"
+                    "1. Use get_rubric to verify rubric settings\n"
+                    "2. Use associate_rubric with use_for_grading=True\n"
+                    "3. Re-run dry_run=True after correcting the configuration\n"
+                )
 
         # Statistics tracking
         stats = {
@@ -1009,11 +1091,37 @@ def register_educator_assignment_tools(mcp: FastMCP):
         }
         failed_results = []
 
-        async def grade_single_submission(user_id: str, grade_info: dict[str, Any]):
+        async def grade_single_submission(
+            user_id: str, grade_info: dict[str, Any]
+        ) -> dict[str, Any]:
             """Grade a single submission."""
             try:
+                # Backstop for issue 239: a comment lifted from fenced read
+                # output would publish our provenance markers into the
+                # student-visible gradebook. Refuse before any write (and
+                # before the dry-run echoes it). Covers the overall comment AND
+                # every per-criterion comment in the rubric assessment.
+                _texts = [grade_info.get("comment") or ""]
+                for _crit in (grade_info.get("rubric_assessment") or {}).values():
+                    if isinstance(_crit, dict):
+                        _texts.append(str(_crit.get("comments") or ""))
+                if any(contains_fence_markers(t) for t in _texts):
+                    return {
+                        "status": "failed",
+                        "user_id": user_id,
+                        "error": FENCE_LEAK_ERROR,
+                    }
+
                 if dry_run:
-                    # In dry run mode, just validate the data
+                    # In dry run mode, just validate the data.
+                    # The preview MUST name any comment: it is student-visible,
+                    # permanent and appended, and an instructor who dry-runs
+                    # first (as the bulk-grading skill instructs) would
+                    # otherwise get no warning that one is about to post (#235).
+                    comment_note = (
+                        f" AND post this student-visible comment: {grade_info['comment']!r}"
+                        if grade_info.get("comment") else ""
+                    )
                     if "rubric_assessment" in grade_info:
                         total_points = sum(
                             criterion.get("points", 0)
@@ -1022,13 +1130,13 @@ def register_educator_assignment_tools(mcp: FastMCP):
                         return {
                             "status": "success",
                             "user_id": user_id,
-                            "message": f"DRY RUN: Would grade with {total_points} rubric points"
+                            "message": f"DRY RUN: Would grade with {total_points} rubric points{comment_note}"
                         }
                     elif "grade" in grade_info:
                         return {
                             "status": "success",
                             "user_id": user_id,
-                            "message": f"DRY RUN: Would grade with {grade_info['grade']} points"
+                            "message": f"DRY RUN: Would grade with {grade_info['grade']} points{comment_note}"
                         }
                     else:
                         return {
@@ -1049,7 +1157,11 @@ def register_educator_assignment_tools(mcp: FastMCP):
                 elif "grade" in grade_info:
                     # Simple grading
                     form_data["submission[posted_grade]"] = str(grade_info["grade"])
-                    if "comment" in grade_info:
+                    # Truthiness, not membership: an explicit comment=None or
+                    # comment="" meant "no comment", but the membership test
+                    # posted it anyway. The rubric path (build_rubric_assessment_
+                    # form_data) has always used truthiness; these now agree.
+                    if grade_info.get("comment"):
                         form_data["comment[text_comment]"] = grade_info["comment"]
                 else:
                     return {
@@ -1071,6 +1183,15 @@ def register_educator_assignment_tools(mcp: FastMCP):
                         "status": "failed",
                         "user_id": user_id,
                         "error": response["error"]
+                    }
+
+                if grade_info.get("rubric_assessment") and not rubric_grade_is_confirmed(
+                    assignment_check, grade_info["rubric_assessment"], response
+                ):
+                    return {
+                        "status": "failed",
+                        "user_id": user_id,
+                        "error": RUBRIC_GRADE_UNCONFIRMED,
                     }
 
                 return {
@@ -1114,7 +1235,7 @@ def register_educator_assignment_tools(mcp: FastMCP):
 
             # Update statistics
             for result in results:
-                if isinstance(result, Exception):
+                if isinstance(result, BaseException):
                     stats["failed"] += 1
                     failed_results.append({
                         "user_id": "unknown",

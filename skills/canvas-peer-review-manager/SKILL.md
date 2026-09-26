@@ -12,7 +12,7 @@ A complete peer review management workflow for educators using Canvas LMS. Monit
 - **Canvas MCP server** must be running and connected to the agent's MCP client (e.g., Claude Code, Cursor, Codex, OpenCode).
 - The authenticated user must have an **educator or instructor role** in the target Canvas course.
 - The assignment must have **peer reviews enabled** in Canvas (either manual or automatic assignment).
-- **FERPA compliance**: Set `ENABLE_DATA_ANONYMIZATION=true` in the Canvas MCP server environment to anonymize student names. When enabled, names render as `Student_xxxxxxxx` hashes while preserving functional user IDs for messaging.
+- **FERPA-conscious handling**: Set `ENABLE_DATA_ANONYMIZATION=true` in the Canvas MCP server environment to anonymize supported student identity fields. When enabled, names render as `Student_xxxxxxxx` hashes while preserving functional user IDs for messaging. This control does not by itself establish compliance.
 
 ## Steps
 
@@ -96,9 +96,9 @@ Call `get_peer_review_followup_list` to get a prioritized list of students requi
 
 ### 8. Send Reminders
 
-**Always use a dry run or review step before sending messages.**
+Both send tools are two-call: the first call returns a preview and a `confirmation_token` and sends nothing; show the preview to the instructor, then call again with the token (and identical arguments) to send.
 
-For targeted reminders, call `send_peer_review_reminders` with:
+For targeted direct Inbox messages, call `send_peer_review_inbox_messages` with:
 
 - `recipient_ids` -- list of Canvas user IDs from the analytics results
 - `custom_message` -- optional custom text (a default template is used if omitted)
@@ -111,11 +111,11 @@ Example flow:
 3. Review the recipient list with the user
 4. Send reminders after confirmation
 
-For a fully automated pipeline, call `send_peer_review_followup_campaign` with just the course identifier and assignment ID. This tool:
+For an automated pipeline, call `send_peer_review_followup_campaign` with the course identifier and assignment ID; the first call returns analytics plus a preview of urgent vs. gentle recipients and a token. This tool:
 
 1. Runs completion analytics automatically
 2. Segments students into "urgent" (none complete) and "partial" groups
-3. Sends appropriately toned reminders to each group
+3. Sends the reminders only on the confirming call with the token
 4. Returns combined analytics and messaging results
 
 **Warning:** The campaign tool sends real messages. Always confirm with the instructor before running it.
@@ -136,7 +136,7 @@ Call `generate_peer_review_feedback_report` for a formatted, shareable report:
 - `report_type="comprehensive"` -- full analysis with samples of low-quality reviews
 - `report_type="summary"` -- executive overview only
 - `report_type="individual"` -- per-student breakdown
-- `include_student_names=false` -- recommended for FERPA compliance
+- `include_student_names=false` -- recommended for privacy-conscious reporting
 
 For a completion-focused report (rather than quality-focused), use `generate_peer_review_report` with options for executive summary, student details, action items, and timeline analysis. This report can be saved to a file with `save_to_file=true`.
 
@@ -158,7 +158,7 @@ Run steps 1-2 to identify incomplete reviewers, then step 8. Always confirm the 
 Run steps 2, 5, 6, and 10. Combine completion analytics with quality analysis into a comprehensive instructor report.
 
 **"Export everything for my records"**
-Run step 9 with `output_format="csv"` and `anonymize_data=true` for a FERPA-safe dataset.
+Run step 9 with `output_format="csv"` and `anonymize_data=true` for a privacy-conscious dataset.
 
 ## MCP Tools Used
 
@@ -172,7 +172,7 @@ Run step 9 with `output_format="csv"` and `anonymize_data=true` for a FERPA-safe
 | `analyze_peer_review_quality` | Quality metrics (scores, word counts, constructiveness) |
 | `identify_problematic_peer_reviews` | Flag low-quality or empty reviews |
 | `get_peer_review_followup_list` | Prioritized list of students needing follow-up |
-| `send_peer_review_reminders` | Send targeted reminder messages |
+| `send_peer_review_inbox_messages` | Send targeted direct Canvas Inbox messages |
 | `send_peer_review_followup_campaign` | Automated analytics-to-messaging pipeline |
 | `extract_peer_review_dataset` | Export data as CSV or JSON |
 | `generate_peer_review_feedback_report` | Quality-focused instructor report |
@@ -205,7 +205,7 @@ Run step 9 with `output_format="csv"` and `anonymize_data=true` for a FERPA-safe
 
 **User:** "Send reminders to the ones who haven't started"
 
-**Agent:** Confirms the 4 recipients, then calls `send_peer_review_reminders` with their user IDs.
+**Agent:** Confirms the 4 recipients, then calls `send_peer_review_inbox_messages` with their user IDs.
 
 **User:** "Now check if the completed reviews are any good"
 
@@ -214,14 +214,13 @@ Run step 9 with `output_format="csv"` and `anonymize_data=true` for a FERPA-safe
 ## Safety Guidelines
 
 - **Confirm before sending** -- Always present the recipient list and message content to the instructor before calling any messaging tool.
-- **Use dry runs** -- When testing workflows, start with a single recipient or confirm the output of analytics tools before acting on the data.
 - **Anonymize by default** -- Use `anonymize_students=true` or `anonymize_data=true` when reviewing data in shared contexts.
 - **Respect rate limits** -- The Canvas API allows roughly 700 requests per 10 minutes. For large courses, the messaging tools send messages sequentially with built-in delays.
-- **FERPA compliance** -- Never display student names in logs, shared screens, or exported files unless the instructor has explicitly confirmed the context is appropriate.
+- **FERPA-conscious handling** -- Never display student names in logs, shared screens, or exported files unless the instructor has explicitly confirmed the context is appropriate.
 
 ## Notes
 
 - Peer reviews must be enabled on the assignment in Canvas before any of these tools return data.
-- The `send_peer_review_followup_campaign` tool combines analytics and messaging into one call -- powerful but sends real messages. Use it only after confirming intent with the instructor.
+- The `send_peer_review_followup_campaign` tool combines analytics and messaging: the first call previews recipients and returns a token, and the second call (with the token) sends real messages. Make the second call only after the instructor approves the preview.
 - Quality analysis uses heuristics (word count, keyword matching, sentiment). It identifies likely low-quality reviews but is not a substitute for instructor judgment.
 - This skill pairs well with `canvas-morning-check` for a full course health overview that includes peer review status alongside submission rates and grade distribution.

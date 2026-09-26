@@ -22,11 +22,13 @@ import base64
 import hmac
 import json
 import sys
+import time
+import uuid
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
-from .core.config import get_config, validate_config
+from .core.config import get_config, validate_canvas_url_scheme, validate_config
 from .core.credentials import (
     RequestCredentials,
     clear_http_request_context,
@@ -34,14 +36,17 @@ from .core.credentials import (
     set_request_credentials,
 )
 from .core.logging import log_error, log_info, log_warning
+from .core.tool_results import install_tool_result_contract
 from .resources import register_resources_and_prompts
 from .tools import (
     register_accessibility_tools,
     register_admin_tools,
     register_code_execution_tools,
+    register_content_migration_tools,
     register_course_tools,
     register_discovery_tools,
     register_educator_assignment_tools,
+    register_educator_course_tools,
     register_educator_discussion_tools,
     register_educator_file_tools,
     register_educator_messaging_tools,
@@ -52,6 +57,7 @@ from .tools import (
     register_peer_review_comment_tools,
     register_peer_review_tools,
     register_rubric_tools,
+    register_self_identity_tools,
     register_shared_assignment_tools,
     register_shared_content_tools,
     register_shared_discussion_tools,
@@ -59,6 +65,7 @@ from .tools import (
     register_shared_messaging_tools,
     register_shared_module_tools,
     register_student_tools,
+    register_student_write_tools,
 )
 
 
@@ -74,6 +81,47 @@ async def _send_json_error(send: Any, status: int, message: str) -> None:
         ],
     })
     await send({"type": "http.response.body", "body": body})
+
+
+# The only public (pre-auth) route posts a form containing one short signed
+# token. 8 KiB is far more than that and far less than a useful memory-pressure
+# lever for an unauthenticated caller.
+_MAX_PUBLIC_BODY_BYTES = 8 * 1024
+
+
+def _declared_content_length(headers: Any) -> int | None:
+    """Parse Content-Length from raw ASGI headers, or None if absent/unparseable."""
+    for name, value in headers or []:
+        if name.lower() == b"content-length":
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+async def _read_body(receive: Any, max_bytes: int | None = None) -> bytes | None:
+    """Read an ASGI request body, optionally refusing bodies over ``max_bytes``.
+
+    Returns ``None`` when the cap is exceeded. The check runs per chunk rather
+    than on the assembled body, so an oversized or chunked upload is abandoned
+    while it streams instead of being buffered first — and because the caller on
+    the public route is unauthenticated, the accumulated bytes are dropped rather
+    than kept for a request that will be rejected anyway.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        msg = await receive()
+        chunk = msg.get("body", b"")
+        if max_bytes is not None:
+            total += len(chunk)
+            if total > max_bytes:
+                return None
+        chunks.append(chunk)
+        if not msg.get("more_body", False):
+            break
+    return b"".join(chunks)
 
 
 def _access_key_ok(presented: str, allowed: frozenset[str]) -> bool:
@@ -116,6 +164,109 @@ def _client_principal_claims(headers: dict[bytes, bytes]) -> dict[str, str]:
         return {}
 
 
+_ADMIN_APPROVE_PATH = "/admin/access/approve"
+_ADMIN_CONFIRM_PATH = "/admin/access/confirm"
+
+
+_overlay_store = None
+
+
+def _access_store(config: Any) -> Any:
+    """Build the overlay store once and reuse it across requests.
+
+    The store's ``is_granted`` TTL cache is per-instance, so it only works if
+    the instance survives between requests — rebuilding per request also re-ran
+    ``create_table_if_not_exists`` and a fresh credential/client every time.
+    Returns None until it can be built (feature off / azure unavailable), and
+    retries on the next call so a transient build failure self-heals.
+    """
+    global _overlay_store
+    if _overlay_store is None:
+        from .core.access.factory import build_store
+        _overlay_store = build_store(config)
+    return _overlay_store
+
+
+def reset_overlay_store() -> None:
+    """Discard the memoized overlay store (test isolation; mirrors reset_config)."""
+    global _overlay_store
+    _overlay_store = None
+
+
+# Admission control for the denied-identity notification path. The email
+# cooldown lives in the storage backend, which is only consulted *inside* the
+# scheduled task — so without a gate here, every denied request already cost an
+# Azure client construction, an asyncio task, and a backend round-trip before
+# anything decided not to send. A denied caller can repeat at will (the 403 is
+# returned immediately), so that work is attacker-controlled.
+_NOTIFY_MIN_INTERVAL_SECONDS = 300
+_NOTIFY_MAX_INFLIGHT = 8
+_NOTIFY_MAX_TRACKED_OIDS = 1024
+
+_notify_last_scheduled: dict[str, float] = {}
+_notify_inflight: set[Any] = set()
+_email_sender = None
+
+
+def reset_notify_state() -> None:
+    """Clear notification admission state (test isolation)."""
+    global _email_sender
+    _notify_last_scheduled.clear()
+    _notify_inflight.clear()
+    _email_sender = None
+
+
+def _notify_admitted(oid: str, now: float) -> bool:
+    """Decide whether to do any notification work for ``oid``, cheaply."""
+    if len(_notify_inflight) >= _NOTIFY_MAX_INFLIGHT:
+        return False
+
+    last = _notify_last_scheduled.get(oid)
+    if last is not None and (now - last) < _NOTIFY_MIN_INTERVAL_SECONDS:
+        return False
+
+    # Bound the table itself: it is keyed by attacker-supplied identities, so an
+    # unbounded dict is the same leak one layer up. Oldest entries go first.
+    if len(_notify_last_scheduled) >= _NOTIFY_MAX_TRACKED_OIDS:
+        for stale, _ in sorted(_notify_last_scheduled.items(), key=lambda kv: kv[1])[:64]:
+            _notify_last_scheduled.pop(stale, None)
+
+    _notify_last_scheduled[oid] = now
+    return True
+
+
+def _schedule_notify(config: Any, store: Any, requester: Any) -> None:
+    """Fire-and-forget admin email; never blocks or breaks the request path."""
+    global _email_sender
+    from .core.access.factory import build_email_sender
+    from .core.access.notify import notify_access_request
+
+    now_float = time.time()
+    if not _notify_admitted(getattr(requester, "oid", ""), now_float):
+        return
+
+    # Memoized: this builds an Azure credential and client, which is far too
+    # much work to repeat per denied request.
+    if _email_sender is None:
+        _email_sender = build_email_sender(config)
+    sender = _email_sender
+    if sender is None:
+        return
+    now = int(time.time())
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    task = asyncio.create_task(notify_access_request(
+        store=store, requester=requester, secret=config.access_token_secret,
+        approve_base_url=config.access_approve_base_url,
+        admin_emails=config.access_admin_emails,
+        cooldown_hours=config.access_notify_cooldown_hours,
+        ttl_seconds=24 * 3600, send_email=sender,
+        jti=uuid.uuid4().hex, now=now, now_iso=now_iso))
+    # Tracked so the in-flight cap above is real, and so the task is not garbage
+    # collected mid-flight (asyncio only holds a weak reference).
+    _notify_inflight.add(task)
+    task.add_done_callback(_notify_inflight.discard)
+
+
 class CanvasCredentialMiddleware:
     """ASGI middleware that extracts the caller's Canvas credentials from headers.
 
@@ -145,11 +296,47 @@ class CanvasCredentialMiddleware:
             await self.app(scope, receive, send)
             return
 
+        config = get_config()
+        path = scope.get("path", "")
+
+        # --- Admin access-approval routes (intercepted before any token gate) ---
+        if path in (_ADMIN_APPROVE_PATH, _ADMIN_CONFIRM_PATH):
+            from .core.access.factory import feature_ready
+            if not (config.access_request_enabled and feature_ready(config)):
+                await _send_json_error(send, 404, "Not found")
+                return
+            store = _access_store(config)
+            if store is None:
+                await _send_json_error(send, 503, "Access service unavailable")
+                return
+            from .core.access import routes
+            now = int(time.time())
+            if path == _ADMIN_APPROVE_PATH:
+                await routes.handle_approve(scope.get("query_string", b""), send,
+                                            store=store, secret=config.access_token_secret, now=now)
+            else:
+                # This route is reached before any authentication, so bound it
+                # before reading anything. It only ever carries a short signed
+                # token in a form post.
+                if scope.get("method", "").upper() != "POST":
+                    await _send_json_error(send, 405, "Method not allowed")
+                    return
+                declared = _declared_content_length(scope.get("headers", []))
+                if declared is not None and declared > _MAX_PUBLIC_BODY_BYTES:
+                    await _send_json_error(send, 413, "Request body too large")
+                    return
+                body = await _read_body(receive, max_bytes=_MAX_PUBLIC_BODY_BYTES)
+                if body is None:
+                    await _send_json_error(send, 413, "Request body too large")
+                    return
+                await routes.handle_confirm(body, send, store=store,
+                                            secret=config.access_token_secret, now=now)
+            return
+
         set_http_request_active(True)
         try:
             # Parse headers from ASGI scope (list of [name, value] byte pairs)
             headers = dict(scope.get("headers", []))
-            config = get_config()
 
             if config.entra_auth_enabled:
                 # Entra platform-auth path: Azure App Service has already validated
@@ -162,8 +349,30 @@ class CanvasCredentialMiddleware:
                 if not oid:
                     await _send_json_error(send, 401, "Missing verified Entra identity")
                     return
-                if config.mcp_entra_allowed_oids and oid not in config.mcp_entra_allowed_oids:
+                in_env = oid in config.mcp_entra_allowed_oids
+                in_overlay = False
+                store = None
+                if not in_env and config.access_request_enabled:
+                    store = _access_store(config)
+                    in_overlay = store.is_granted(oid) if store else False
+                if config.mcp_entra_allowed_oids and not (in_env or in_overlay):
+                    # Send the deny FIRST, so scheduling the access-request email
+                    # can never delay or break the 403 (auth boundary: respond,
+                    # then notify). The notify is additionally guarded so a
+                    # scheduling error degrades to "no email", never a dropped 403.
                     await _send_json_error(send, 403, "Identity not authorized for this MCP server")
+                    if config.access_request_enabled and store is not None:
+                        try:
+                            claims_for_req = _client_principal_claims(headers)
+                            from .core.access.store import Requester
+                            requester = Requester(
+                                oid=oid,
+                                upn=claims_for_req.get("preferred_username")
+                                or claims_for_req.get("upn", ""),
+                                display_name=claims_for_req.get("name", ""))
+                            _schedule_notify(config, store, requester)
+                        except Exception as exc:
+                            log_error(f"access-request notify scheduling failed: {exc}")
                     return
                 claims = _client_principal_claims(headers)
                 # Log only the stable, opaque identifiers (oid GUID, scope, client
@@ -211,19 +420,14 @@ class CanvasCredentialMiddleware:
             clear_http_request_context()
 
 
-def create_server(
-    host: str = "127.0.0.1",
-    port: int = 8000,
-    transport: str = "stdio",
-) -> FastMCP:
-    """Create and configure the Canvas MCP server."""
+def create_server() -> FastMCP:
+    """Create and configure the Canvas MCP server.
+
+    fastmcp takes host/port at serve time (run()/uvicorn), not on the
+    constructor — see _run_http_server.
+    """
     config = get_config()
-    kwargs: dict[str, Any] = {"name": config.mcp_server_name}
-    if transport != "stdio":
-        kwargs["host"] = host
-        kwargs["port"] = port
-    mcp = FastMCP(**kwargs)
-    return mcp
+    return FastMCP(name=config.mcp_server_name)
 
 
 def register_all_tools(mcp: FastMCP, role: str = "all") -> None:
@@ -234,6 +438,7 @@ def register_all_tools(mcp: FastMCP, role: str = "all") -> None:
         role: One of "student", "educator", or "all" (default)
     """
     log_info(f"Registering Canvas MCP tools (role: {role})...")
+    install_tool_result_contract(mcp)
 
     # Shared tools — always registered for all roles
     register_course_tools(mcp)
@@ -244,14 +449,21 @@ def register_all_tools(mcp: FastMCP, role: str = "all") -> None:
     register_shared_file_tools(mcp)
     register_shared_messaging_tools(mcp)
     register_discovery_tools(mcp)
+    # Caller-scoped identity: needs no roster permission, so every profile gets it.
+    register_self_identity_tools(mcp)
 
     # Student-specific tools
     if role in ("student", "all"):
         register_student_tools(mcp)
+        # Tier 1 writes register only for tools the operator named in
+        # STUDENT_WRITE_TOOLS (default: none). See tools/student_write.py.
+        register_student_write_tools(mcp)
 
     # Educator-specific tools
     if role in ("educator", "all"):
         register_educator_assignment_tools(mcp)
+        register_educator_course_tools(mcp)
+        register_content_migration_tools(mcp)
         register_educator_discussion_tools(mcp)
         register_educator_module_tools(mcp)
         register_educator_file_tools(mcp)
@@ -313,6 +525,34 @@ def test_connection() -> bool:
         return False
 
 
+def _cmd_list_grants(args: argparse.Namespace) -> int:
+    """List self-service access grants from the overlay store. Returns an exit code."""
+    store = _access_store(get_config())
+    if store is None:
+        print("Access store unavailable (check ACCESS_* config + az login).")
+        return 1
+    grants = store.list_grants()
+    if not grants:
+        print("No self-service grants.")
+        return 0
+    for g in grants:
+        print(f"{g.oid}\t{g.display_name}\t{g.upn}\t{g.granted_utc}")
+    return 0
+
+
+def _cmd_revoke(args: argparse.Namespace) -> int:
+    """Revoke one self-service access grant by Entra OID. Returns an exit code."""
+    store = _access_store(get_config())
+    if store is None:
+        print("Access store unavailable (check ACCESS_* config + az login).")
+        return 1
+    if store.revoke(args.revoke):
+        print(f"revoked {args.revoke}")
+        return 0
+    print(f"oid not found: {args.revoke}")
+    return 1
+
+
 def main() -> None:
     """Main entry point for the Canvas MCP server."""
     parser = argparse.ArgumentParser(
@@ -349,7 +589,17 @@ def main() -> None:
         "--role",
         choices=["student", "educator", "all"],
         default=None,
-        help="Tool profile: student (~31 tools), educator (~86 tools), all (default: all)"
+        help="Tool profile: student (~37 tools), educator (~88 tools), all (default: all)"
+    )
+    parser.add_argument(
+        "--list-grants",
+        action="store_true",
+        help="List self-service access grants (hosted; needs az login) and exit"
+    )
+    parser.add_argument(
+        "--revoke",
+        metavar="OID",
+        help="Revoke a self-service access grant by Entra OID and exit"
     )
 
     args = parser.parse_args()
@@ -357,12 +607,26 @@ def main() -> None:
 
     config = get_config()
 
+    # Admin access-approval commands talk only to the overlay store (Azure, via
+    # az login) — not Canvas — so dispatch them before the Canvas-credential /
+    # HTTP-mode validation below, which they don't need.
+    if args.list_grants:
+        raise SystemExit(_cmd_list_grants(args))
+    if args.revoke:
+        raise SystemExit(_cmd_revoke(args))
+
     # HTTP mode: the Canvas URL is server-pinned and per-user tokens arrive via
     # X-Canvas-Token. A server token must NOT be set, or a missing request token
     # could silently fall back to it (mis-attributing actions to the operator).
     if is_http:
         if not config.canvas_api_url:
             log_error("CANVAS_API_URL is required in HTTP mode (the Canvas API URL is server-pinned)")
+            sys.exit(1)
+        # HTTP mode never calls validate_config() (that path is stdio's .env
+        # check), so the cleartext-URL rejection has to be applied here too.
+        # It matters more here than in stdio: the URL is server-pinned, so one
+        # http:// typo leaks every caller's token, not just the operator's.
+        if not validate_canvas_url_scheme():
             sys.exit(1)
         if config.canvas_api_token:
             log_error(
@@ -519,20 +783,22 @@ def main() -> None:
     log_info("Use Ctrl+C to stop the server")
 
     # Create and configure server
-    mcp = create_server(
-        host=args.host, port=args.port, transport=args.transport
-    )
+    mcp = create_server()
     # Resolve role: CLI flag > env var > default
     role = args.role or config.canvas_role
     if role not in ("student", "educator", "all"):
         log_warning(f"Unknown role '{role}', defaulting to 'all'")
         role = "all"
+    # Make the resolved role authoritative so runtime tool behavior (e.g.
+    # list_courses reading get_config().canvas_role) matches the registered
+    # profile even when the CLI --role flag overrides the CANVAS_ROLE env var.
+    config.canvas_role = role
     log_info(f"Tool profile: {role}")
     register_all_tools(mcp, role=role)
 
     try:
         if is_http:
-            _run_http_server(mcp)
+            _run_http_server(mcp, host=args.host, port=args.port)
         else:
             mcp.run()
     except KeyboardInterrupt:
@@ -552,18 +818,27 @@ def main() -> None:
         log_info("Server stopped")
 
 
-def _run_http_server(mcp: FastMCP) -> None:
+def _run_http_server(mcp: FastMCP, host: str, port: int) -> None:
     """Run the MCP server with HTTP transport and credential middleware."""
     import uvicorn
 
-    # Get the Starlette app from FastMCP, then wrap with credential middleware
-    starlette_app = mcp.streamable_http_app()
+    # fastmcp: http_app() replaces v1 streamable_http_app(); streamable
+    # HTTP is the default transport and the endpoint stays mounted at /mcp.
+    # CanvasCredentialMiddleware passes lifespan scopes through, so the
+    # inner app's lifespan (required by fastmcp) still runs under uvicorn.
+    #
+    # stateless_http=True: every request is self-contained (credentials arrive
+    # per-request via X-Canvas-Token; no tool uses server-initiated session
+    # features), so keeping an in-memory session table only creates a failure
+    # mode — an App Service recycle drops it, and mcp-remote hangs forever on
+    # the resulting stale-session 404 instead of re-initializing (issue #159).
+    starlette_app = mcp.http_app(stateless_http=True)
     app = CanvasCredentialMiddleware(starlette_app)
 
     config = uvicorn.Config(
         app,
-        host=mcp.settings.host,
-        port=mcp.settings.port,
+        host=host,
+        port=port,
         log_level="info",
     )
     server = uvicorn.Server(config)

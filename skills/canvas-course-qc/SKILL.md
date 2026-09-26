@@ -114,7 +114,7 @@ After presenting the report, offer actionable next steps:
 > Would you like me to:
 > 1. **Auto-fix publishing** -- Publish all unpublished modules (with confirmation)
 > 2. **Show details** -- Expand on a specific issue
-> 3. **Run accessibility audit** -- Check WCAG compliance (uses canvas-accessibility-auditor skill)
+> 3. **Run accessibility audit** -- Check for WCAG-oriented issues (uses canvas-accessibility-auditor skill)
 > 4. **Check another course**
 
 For auto-fix, use `update_module` or `bulk_update_pages` with user confirmation before each batch.
@@ -129,7 +129,7 @@ For auto-fix, use `update_module` or `bulk_update_pages` with user confirmation 
 | `get_assignment_details` | Deep-dive on flagged assignments |
 | `list_pages` | Check for front page |
 | `get_page_content` | Verify pages have content |
-| `list_all_rubrics` | Check rubric coverage |
+| `list_rubrics` | Check rubric coverage |
 | `update_module` | Auto-fix: publish modules |
 | `bulk_update_pages` | Auto-fix: publish pages |
 

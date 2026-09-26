@@ -5,19 +5,34 @@ and module items. Modules are the primary content organization system in Canvas.
 """
 
 
-from mcp.server.fastmcp import FastMCP
+from typing import Any
+
+from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ..core.cache import get_course_code, get_course_id
 from ..core.client import fetch_all_paginated_results, make_canvas_request
 from ..core.dates import format_date, parse_date
+from ..core.untrusted_content import (
+    FENCE_LEAK_ERROR,
+    contains_fence_markers,
+    fence_untrusted_inline,
+)
 from ..core.validation import validate_params
+from ..core.write_confirmation import (
+    ConfirmationGuard,
+    preview_with_token,
+    redeem_confirmation,
+)
+
+_DELETE_MODULE_GUARD = ConfirmationGuard(nothing_done="Nothing was deleted.")
+_DELETE_MODULE_ITEM_GUARD = ConfirmationGuard(nothing_done="Nothing was deleted.")
 
 
-def register_shared_module_tools(mcp: FastMCP):
+def register_shared_module_tools(mcp: FastMCP) -> None:
     """Register module tools accessible to both students and educators."""
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def list_modules(
         course_identifier: str | int,
@@ -33,7 +48,7 @@ def register_shared_module_tools(mcp: FastMCP):
         """
         course_id = await get_course_id(course_identifier)
 
-        params = {"per_page": 100}
+        params: dict[str, Any] = {"per_page": 100}
         if include_items:
             params["include[]"] = ["items"]
         if search_term:
@@ -63,7 +78,8 @@ def register_shared_module_tools(mcp: FastMCP):
             require_sequential = module.get("require_sequential_progress", False)
             prerequisite_ids = module.get("prerequisite_module_ids", [])
 
-            result += f"**{name}**\n"
+            # Module names and item titles are instructor-authored (issue 239).
+            result += f"**{fence_untrusted_inline(name, 'module name')}**\n"
             result += f"  ID: {module_id}\n"
             result += f"  Position: {position}\n"
             result += f"  Status: {state} | Published: {'Yes' if published else 'No'}\n"
@@ -84,7 +100,7 @@ def register_shared_module_tools(mcp: FastMCP):
                     for item in items[:5]:  # Show first 5 items
                         item_title = item.get("title", "Untitled")
                         item_type = item.get("type", "Unknown")
-                        result += f"    - {item_title} ({item_type})\n"
+                        result += f"    - {fence_untrusted_inline(item_title, 'module item title')} ({item_type})\n"
                     if len(items) > 5:
                         result += f"    ... and {len(items) - 5} more items\n"
 
@@ -92,7 +108,7 @@ def register_shared_module_tools(mcp: FastMCP):
 
         return result
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_course_structure(
         course_identifier: str | int,
@@ -155,7 +171,9 @@ def register_shared_module_tools(mcp: FastMCP):
                 filtered_items.append({
                     "id": item.get("id"),
                     "type": item_type,
-                    "title": item.get("title", "Untitled"),
+                    # Author-controlled titles fenced even in the JSON payload
+                    # (issue 239).
+                    "title": fence_untrusted_inline(item.get("title", "Untitled"), "module item title"),
                     "published": item_published,
                     "position": item.get("position"),
                     "content_id": item.get("content_id"),
@@ -170,7 +188,7 @@ def register_shared_module_tools(mcp: FastMCP):
 
             structured_modules.append({
                 "id": module.get("id"),
-                "name": module.get("name", "Unnamed"),
+                "name": fence_untrusted_inline(module.get("name", "Unnamed"), "module name"),
                 "position": module.get("position"),
                 "published": module_published,
                 "unlock_at": format_date(module.get("unlock_at")) if module.get("unlock_at") else None,
@@ -196,10 +214,10 @@ def register_shared_module_tools(mcp: FastMCP):
         return json.dumps(result)
 
 
-def register_educator_module_tools(mcp: FastMCP):
+def register_educator_module_tools(mcp: FastMCP) -> None:
     """Register educator-only module management tools."""
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=False, idempotent_hint=False))
     @validate_params
     async def create_module(
         course_identifier: str | int,
@@ -210,7 +228,11 @@ def register_educator_module_tools(mcp: FastMCP):
         prerequisite_module_ids: str | None = None,
         published: bool = True
     ) -> str:
-        """Create a new module in a course.
+        """Create a module in a course.
+
+        Modules are published by default, so the module (and any published
+        items later added to it) is visible to students on creation, subject to
+        unlock_at and prerequisites; pass published=False to build it as a draft.
 
         Args:
             course_identifier: Course code or Canvas ID
@@ -221,10 +243,14 @@ def register_educator_module_tools(mcp: FastMCP):
             prerequisite_module_ids: Comma-separated module IDs that must be completed first
             published: Whether the module is published (default: True)
         """
+        # Backstop for issue 239: never publish our provenance markers.
+        if contains_fence_markers(name):
+            return FENCE_LEAK_ERROR
+
         course_id = await get_course_id(course_identifier)
 
         # Build module parameters
-        module_params = {
+        module_params: dict[str, Any] = {
             "module[name]": name,
             "module[published]": str(published).lower()
         }
@@ -281,7 +307,7 @@ def register_educator_module_tools(mcp: FastMCP):
 
         return result
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
     @validate_params
     async def update_module(
         course_identifier: str | int,
@@ -305,10 +331,14 @@ def register_educator_module_tools(mcp: FastMCP):
             prerequisite_module_ids: Comma-separated prerequisite module IDs, or empty to clear
             published: Whether the module is published
         """
+        # Backstop for issue 239: never publish our provenance markers.
+        if name is not None and contains_fence_markers(name):
+            return FENCE_LEAK_ERROR
+
         course_id = await get_course_id(course_identifier)
 
         # Build update parameters (only include changed fields)
-        module_params = {}
+        module_params: dict[str, Any] = {}
 
         if name is not None:
             module_params["module[name]"] = name
@@ -375,53 +405,63 @@ def register_educator_module_tools(mcp: FastMCP):
 
         return result
 
-    @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
     @validate_params
     async def delete_module(
         course_identifier: str | int,
-        module_id: str | int
+        module_id: str | int,
+        confirmation_token: str | None = None
     ) -> str:
-        """Delete a module from a course.
+        """Delete a module. Two-step: preview first, then confirm with the token.
 
-        IMPORTANT: Permanently removes the module and its item associations. The actual content (pages, assignments, etc.) is NOT deleted, only the module organization.
+        Permanently removes the module and its item links. The linked content
+        (pages, assignments, files, etc.) is not deleted and stays in the course.
 
         Args:
             course_identifier: Course code or Canvas ID
             module_id: Module ID to delete
+            confirmation_token: Token from the preview call; omit to preview
         """
         course_id = await get_course_id(course_identifier)
 
-        # First get module info for confirmation
         module_response = await make_canvas_request(
-            "get",
-            f"/courses/{course_id}/modules/{module_id}"
+            "get", f"/courses/{course_id}/modules/{module_id}"
         )
+        if "error" in module_response:
+            return f"Error fetching module details: {module_response['error']}"
+        module_name = module_response.get("name", "Unknown")
+        items_count = module_response.get("items_count", 0)
+        shown_name = fence_untrusted_inline(module_name, "module name")
 
-        module_name = "Unknown"
-        items_count = 0
-        if "error" not in module_response:
-            module_name = module_response.get("name", "Unknown")
-            items_count = module_response.get("items_count", 0)
+        course_display = await get_course_code(course_id) or course_identifier
+        fingerprint = _DELETE_MODULE_GUARD.fingerprint(
+            "delete_module", str(course_id), str(module_id), module_name, str(items_count)
+        )
+        if not confirmation_token:
+            preview = (
+                f"Would delete module **{shown_name}** from course {course_display}\n"
+                f"  Module ID: {module_id}\n"
+                f"  Items affected: {items_count} (items unlinked, content preserved)"
+            )
+            return preview_with_token(_DELETE_MODULE_GUARD, fingerprint, "delete_module", preview)
+        error = redeem_confirmation(_DELETE_MODULE_GUARD, confirmation_token, fingerprint)
+        if error:
+            return error
 
-        # Delete the module
         response = await make_canvas_request(
-            "delete",
-            f"/courses/{course_id}/modules/{module_id}"
+            "delete", f"/courses/{course_id}/modules/{module_id}"
         )
-
         if isinstance(response, dict) and "error" in response:
             return f"Error deleting module: {response['error']}"
 
-        course_display = await get_course_code(course_id) or course_identifier
         result = "✅ Module deleted successfully!\n\n"
-        result += f"  Deleted: **{module_name}**\n"
+        result += f"  Deleted: **{shown_name}**\n"
         result += f"  Course: {course_display}\n"
         result += f"  Module ID: {module_id}\n"
         result += f"  Items affected: {items_count} (items unlinked, content preserved)\n"
-
         return result
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=False, idempotent_hint=False))
     @validate_params
     async def add_module_item(
         course_identifier: str | int,
@@ -439,7 +479,9 @@ def register_educator_module_tools(mcp: FastMCP):
     ) -> str:
         """Add an item to a module.
 
-        IMPORTANT: content_id required for File, Discussion, Assignment, Quiz, ExternalTool. page_url required for Page. title required for SubHeader, ExternalUrl.
+        Required fields depend on item_type: content_id for File, Discussion,
+        Assignment, Quiz, and ExternalTool; page_url for Page; title for
+        SubHeader and ExternalUrl.
 
         Args:
             course_identifier: Course code or Canvas ID
@@ -455,6 +497,10 @@ def register_educator_module_tools(mcp: FastMCP):
             completion_requirement_type: One of: must_view, must_submit, must_contribute, min_score, must_mark_done
             completion_requirement_min_score: Minimum score (only for min_score type)
         """
+        # Backstop for issue 239: never publish our provenance markers.
+        if title is not None and contains_fence_markers(title):
+            return FENCE_LEAK_ERROR
+
         course_id = await get_course_id(course_identifier)
 
         # Validate item type
@@ -464,7 +510,7 @@ def register_educator_module_tools(mcp: FastMCP):
             return f"Invalid item_type '{item_type}'. Must be one of: {', '.join(valid_types)}"
 
         # Build item parameters
-        item_params = {
+        item_params: dict[str, Any] = {
             "module_item[type]": item_type
         }
 
@@ -566,7 +612,7 @@ def register_educator_module_tools(mcp: FastMCP):
 
         return result
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
     @validate_params
     async def update_module_item(
         course_identifier: str | int,
@@ -598,10 +644,14 @@ def register_educator_module_tools(mcp: FastMCP):
             published: Whether the item is published
             move_to_module_id: Move item to a different module
         """
+        # Backstop for issue 239: never publish our provenance markers.
+        if title is not None and contains_fence_markers(title):
+            return FENCE_LEAK_ERROR
+
         course_id = await get_course_id(course_identifier)
 
         # Build update parameters
-        item_params = {}
+        item_params: dict[str, Any] = {}
 
         if title is not None:
             item_params["module_item[title]"] = title
@@ -678,51 +728,64 @@ def register_educator_module_tools(mcp: FastMCP):
 
         return result
 
-    @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
     @validate_params
     async def delete_module_item(
         course_identifier: str | int,
         module_id: str | int,
-        item_id: str | int
+        item_id: str | int,
+        confirmation_token: str | None = None
     ) -> str:
-        """Remove an item from a module.
+        """Remove an item from a module. Two-step: preview first, then confirm with the token.
 
-        IMPORTANT: Only unlinks the item from the module. The actual content (page, assignment, etc.) is NOT deleted.
+        Only unlinks the item from the module; the linked content (page,
+        assignment, etc.) is not deleted.
 
         Args:
             course_identifier: Course code or Canvas ID
             module_id: Module ID containing the item
             item_id: Item ID to remove
+            confirmation_token: Token from the preview call; omit to preview
         """
         course_id = await get_course_id(course_identifier)
 
-        # First get item info for confirmation
         item_response = await make_canvas_request(
-            "get",
-            f"/courses/{course_id}/modules/{module_id}/items/{item_id}"
+            "get", f"/courses/{course_id}/modules/{module_id}/items/{item_id}"
         )
+        if "error" in item_response:
+            return f"Error fetching module item details: {item_response['error']}"
+        item_title = item_response.get("title", "Unknown")
+        item_type = item_response.get("type", "Unknown")
+        shown_title = fence_untrusted_inline(item_title, "module item title")
 
-        item_title = "Unknown"
-        item_type = "Unknown"
-        if "error" not in item_response:
-            item_title = item_response.get("title", "Unknown")
-            item_type = item_response.get("type", "Unknown")
+        course_display = await get_course_code(course_id) or course_identifier
+        fingerprint = _DELETE_MODULE_ITEM_GUARD.fingerprint(
+            "delete_module_item", str(course_id), str(module_id), str(item_id), item_title, item_type
+        )
+        if not confirmation_token:
+            preview = (
+                f"Would remove **{shown_title}** ({item_type}) from module {module_id} "
+                f"in course {course_display}\n"
+                f"  Item ID: {item_id}\n"
+                "  Note: The underlying content is NOT deleted, only unlinked from this module."
+            )
+            return preview_with_token(
+                _DELETE_MODULE_ITEM_GUARD, fingerprint, "delete_module_item", preview
+            )
+        error = redeem_confirmation(_DELETE_MODULE_ITEM_GUARD, confirmation_token, fingerprint)
+        if error:
+            return error
 
-        # Delete the item
         response = await make_canvas_request(
-            "delete",
-            f"/courses/{course_id}/modules/{module_id}/items/{item_id}"
+            "delete", f"/courses/{course_id}/modules/{module_id}/items/{item_id}"
         )
-
         if isinstance(response, dict) and "error" in response:
             return f"Error deleting module item: {response['error']}"
 
-        course_display = await get_course_code(course_id) or course_identifier
         result = "✅ Module item removed successfully!\n\n"
-        result += f"  Removed: **{item_title}** ({item_type})\n"
+        result += f"  Removed: **{shown_title}** ({item_type})\n"
         result += f"  Course: {course_display}\n"
         result += f"  Module ID: {module_id}\n"
         result += f"  Item ID: {item_id}\n"
         result += "\n  Note: The underlying content was NOT deleted, only unlinked from this module.\n"
-
         return result

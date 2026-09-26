@@ -2,44 +2,117 @@
 
 import json
 import re
+from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from ..core.anonymization import anonymize_response_data
 from ..core.cache import get_course_code, get_course_id
 from ..core.client import fetch_all_paginated_results, make_canvas_request
 from ..core.dates import format_date, parse_date, truncate_text
-from ..core.logging import log_error, log_warning
+from ..core.logging import log_warning
+from ..core.untrusted_content import (
+    FENCE_LEAK_ERROR,
+    contains_fence_markers,
+    fence_untrusted,
+    fence_untrusted_inline,
+)
 from ..core.validation import validate_params
+from ..core.write_confirmation import (
+    ConfirmationGuard,
+    preview_with_token,
+    redeem_confirmation,
+    unconfirmed_write_warning,
+)
+
+# One guard per delete tool (#318); tokens are bound to the tool name, the
+# course, the exact target ids and the titles the preview displayed.
+_DELETE_ANNOUNCEMENT_GUARD = ConfirmationGuard(nothing_done="Nothing was deleted.")
+_BULK_DELETE_GUARD = ConfirmationGuard(nothing_done="Nothing was deleted.")
+_CRITERIA_DELETE_GUARD = ConfirmationGuard(nothing_done="Nothing was deleted.")
+
+# Issue #283: a permission error on create_announcement is not license to
+# post the same content as a discussion instead. Client models were doing
+# exactly that — a silent, unconfirmed write the user never asked for. This
+# text rides along with the error so the model sees the guardrail at the
+# moment it would otherwise reach for a fallback tool.
+ANNOUNCEMENT_PERMISSION_FALLBACK_WARNING = (
+    "Do not attempt to post this content via discussion tools as a "
+    "fallback; announcements require instructor/TA permissions in this "
+    "course. Report this to the user instead."
+)
+
+# Substrings that show up in make_canvas_request's {"error": ...} payload
+# for an authorization failure (see core/client.py: "HTTP error: 401/403,
+# Details: {...}"), plus the Canvas API's own wording for the same failure.
+_PERMISSION_ERROR_MARKERS = (
+    "HTTP error: 401",
+    "HTTP error: 403",
+    "unauthorized",
+    "forbidden",
+)
 
 
-def register_shared_discussion_tools(mcp: FastMCP):
+def _is_permission_error(error_text: str) -> bool:
+    """True if a Canvas API error looks like an auth/permission failure."""
+    lowered = error_text.lower()
+    return any(marker.lower() in lowered for marker in _PERMISSION_ERROR_MARKERS)
+
+
+def register_shared_discussion_tools(mcp: FastMCP) -> None:
     """Register discussion tools accessible to both students and educators."""
 
     # ===== DISCUSSION TOOLS =====
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def list_discussion_topics(course_identifier: str | int,
                                    include_announcements: bool = False) -> str:
         """List discussion topics for a specific course.
 
+        Returns discussion topics only. Announcements are a separate Canvas
+        collection and are NOT included unless include_announcements=True.
+        To list announcements on their own, use list_announcements instead.
+
         Args:
             course_identifier: Course code or Canvas ID
-            include_announcements: Include announcements in the list (default: False)
+            include_announcements: Also list the course's announcements
+                alongside its discussion topics (default: False). Each entry is
+                labelled "Type: Announcement" or "Type: Discussion".
         """
         course_id = await get_course_id(course_identifier)
 
-        params = {"per_page": 100}
-
-        if include_announcements:
-            params["include[]"] = ["announcement"]
-
-        topics = await fetch_all_paginated_results(f"/courses/{course_id}/discussion_topics", params)
+        # Canvas serves discussions and announcements from the same endpoint but
+        # as disjoint sets: the index excludes announcements unless
+        # only_announcements=true, which then excludes ordinary discussions.
+        # There is no single query returning both, so combining requires two
+        # calls. (include[]=announcement is NOT a supported include value --
+        # Canvas silently ignores it. Issue #238.)
+        topics = await fetch_all_paginated_results(
+            f"/courses/{course_id}/discussion_topics", {"per_page": 100}
+        )
 
         if isinstance(topics, dict) and "error" in topics:
             return f"Error fetching discussion topics: {topics['error']}"
+
+        if include_announcements:
+            announcements = await fetch_all_paginated_results(
+                f"/courses/{course_id}/discussion_topics",
+                {"only_announcements": True, "per_page": 100},
+            )
+            if isinstance(announcements, dict) and "error" in announcements:
+                # Announcements are commonly restricted separately; degrade to
+                # the discussions we did get rather than failing the whole call.
+                log_warning(
+                    "list_discussion_topics: announcements unavailable",
+                    course_id=course_id,
+                    error=announcements["error"],
+                )
+            elif announcements:
+                seen = {topic.get("id") for topic in topics}
+                topics = list(topics) + [
+                    a for a in announcements if a.get("id") not in seen
+                ]
 
         if not topics:
             return f"No discussion topics found for course {course_identifier}."
@@ -55,14 +128,64 @@ def register_shared_discussion_tools(mcp: FastMCP):
             topic_type = "Announcement" if is_announcement else "Discussion"
             status = "Published" if published else "Unpublished"
 
+            # Titles are author-controlled (students, where the course allows
+            # student topics) — fenced in listings too, not just detail views
+            # (issue 239).
             topics_info.append(
-                f"ID: {topic_id}\nType: {topic_type}\nTitle: {title}\nStatus: {status}\nPosted: {posted_at}\n"
+                f"ID: {topic_id}\nType: {topic_type}\n"
+                f"Title:\n{fence_untrusted(title, 'discussion topic title')}\n"
+                f"Status: {status}\nPosted: {posted_at}\n"
             )
 
         course_display = await get_course_code(course_id) or course_identifier
         return f"Discussion Topics for Course {course_display}:\n\n" + "\n".join(topics_info)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
+    @validate_params
+    async def list_announcements(course_identifier: str) -> str:
+        """List a course's announcements, and nothing else.
+
+        Returns announcements only -- ordinary discussion topics are excluded.
+        Use list_discussion_topics for discussions.
+
+        Args:
+            course_identifier: Course code or Canvas ID
+        """
+        course_id = await get_course_id(course_identifier)
+
+        params = {
+            # only_announcements is the filter Canvas honours. include[]=announcement
+            # is NOT a supported include value and is silently ignored (issue #238);
+            # measured identical result sets with and without it.
+            "only_announcements": True,
+            "per_page": 100
+        }
+
+        announcements = await fetch_all_paginated_results(f"/courses/{course_id}/discussion_topics", params)
+
+        if isinstance(announcements, dict) and "error" in announcements:
+            return f"Error fetching announcements: {announcements['error']}"
+
+        if not announcements:
+            return f"No announcements found for course {course_identifier}."
+
+        announcements_info = []
+        for announcement in announcements:
+            announcement_id = announcement.get("id")
+            title = announcement.get("title", "Untitled announcement")
+            posted_at = format_date(announcement.get("posted_at"))
+
+            # Titles are author-controlled (issue 239) — fenced in the
+            # announcement-only path too, not just list_discussion_topics.
+            announcements_info.append(
+                f"ID: {announcement_id}\n"
+                f"Title:\n{fence_untrusted(title, 'announcement title')}\nPosted: {posted_at}\n"
+            )
+
+        course_display = await get_course_code(course_id) or course_identifier
+        return f"Announcements for Course {course_display}:\n\n" + "\n".join(announcements_info)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_discussion_topic_details(course_identifier: str | int,
                                          topic_id: str | int) -> str:
@@ -107,10 +230,12 @@ def register_shared_discussion_tools(mcp: FastMCP):
         topic_type = "Announcement" if is_announcement else "Discussion"
 
         result = f"{topic_type} Details for Course {course_display}:\n\n"
-        result += f"Title: {title}\n"
+        # Topic titles are author-controlled too (students, where the course
+        # allows student topics) — fenced like the body (issue 239).
+        result += f"Title:\n{fence_untrusted(title, 'discussion topic title')}\n"
         result += f"ID: {topic_id}\n"
         result += f"Type: {topic_type}\n"
-        result += f"Author: {author_name} (ID: {author_id})\n"
+        result += f"Author: {fence_untrusted_inline(author_name, 'author name')} (ID: {author_id})\n"
         result += f"Created: {created_at}\n"
         result += f"Posted: {posted_at}\n"
 
@@ -127,11 +252,13 @@ def register_shared_discussion_tools(mcp: FastMCP):
         result += f"Read State: {read_state.title()}\n"
 
         if message:
-            result += f"\nContent:\n{message}"
+            # Topic bodies are third-party text (issue 239): mark provenance
+            # so embedded directives read as data, not instructions.
+            result += f"\nContent:\n{fence_untrusted(message, 'discussion topic body')}"
 
         return result
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def list_discussion_entries(course_identifier: str | int,
                                     topic_id: str | int,
@@ -159,32 +286,8 @@ def register_shared_discussion_tools(mcp: FastMCP):
         if not entries:
             return f"No discussion entries found for topic {topic_id}."
 
-        # Anonymize entries to protect student privacy
-        try:
-            anonymized_entries = anonymize_response_data(entries, data_type="discussions")
-            # Basic validation: check that anonymization occurred
-            if anonymized_entries and isinstance(anonymized_entries, list) and len(anonymized_entries) > 0:
-                # Verify first entry was anonymized (has anonymous user_name)
-                first_entry = anonymized_entries[0]
-                if first_entry.get("user_name", "").startswith("Student_"):
-                    entries = anonymized_entries  # Use anonymized data
-                else:
-                    log_warning(
-                        "Anonymization may not have been applied properly",
-                        course_id=course_id,
-                        topic_id=topic_id
-                    )
-            else:
-                entries = anonymized_entries  # Use result even if validation unclear
-        except Exception as e:
-            # Log error but continue with original data rather than failing completely
-            log_error(
-                "Failed to anonymize discussion entries",
-                exc=e,
-                course_id=course_id,
-                topic_id=topic_id
-            )
-            # Continue with original data - this maintains functionality while logging the issue
+        # Anonymization happens at the client layer (core/client.py) per
+        # ENABLE_DATA_ANONYMIZATION -- this endpoint matches _should_anonymize_endpoint (#179)
 
         # Enhanced content fetching using multiple methods
         if include_full_content or include_replies:
@@ -282,7 +385,7 @@ def register_shared_discussion_tools(mcp: FastMCP):
             # Handle replies
             replies_info = ""
             if include_replies:
-                replies = []
+                replies: list[Any] | Any = []
 
                 # Try to get replies from enhanced fetch first
                 if entry_id_str in full_entries_map:
@@ -328,7 +431,10 @@ def register_shared_discussion_tools(mcp: FastMCP):
                         else:
                             reply_clean = "[No content]"
 
-                        replies_info += f"    {i}. {reply_user} ({reply_created}): {reply_clean}\n"
+                        replies_info += (
+                            f"    {i}. {fence_untrusted_inline(reply_user, 'author name')} ({reply_created}): "
+                            f"{fence_untrusted(reply_clean, 'discussion reply by a course participant')}\n"
+                        )
                 else:
                     replies_info = "\n  No replies found.\n"
             else:
@@ -347,13 +453,18 @@ def register_shared_discussion_tools(mcp: FastMCP):
 
             # Build entry info
             entry_info = f"Entry ID: {entry_id}\n"
-            entry_info += f"Author: {user_name} (ID: {user_id})\n"
+            entry_info += f"Author: {fence_untrusted_inline(user_name, 'author name')} (ID: {user_id})\n"
             entry_info += f"Posted: {created_at}{replies_info}\n"
 
+            # Entry bodies are student-authored (issue 239): fence them so the
+            # model reads them as data with visible provenance.
+            fenced_message = fence_untrusted(
+                message_display, "discussion entry by a course participant"
+            )
             if include_full_content:
-                entry_info += f"Full Content:\n{message_display}\n"
+                entry_info += f"Full Content:\n{fenced_message}\n"
             else:
-                entry_info += f"Content Preview: {message_display}\n"
+                entry_info += f"Content Preview:\n{fenced_message}\n"
 
             entries_info.append(entry_info)
 
@@ -364,9 +475,14 @@ def register_shared_discussion_tools(mcp: FastMCP):
         if not include_replies:
             footer += "\n💡 Tip: Use include_replies=True to fetch all replies"
 
-        return f"Discussion Entries for '{topic_title}' in Course {course_display}:\n\n" + "\n".join(entries_info) + footer
+        return (
+            f"Discussion Entries in Course {course_display} — topic title:\n"
+            f"{fence_untrusted(topic_title, 'discussion topic title')}\n\n"
+            + "\n".join(entries_info)
+            + footer
+        )
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_discussion_entry_details(course_identifier: str | int,
                                          topic_id: str | int,
@@ -384,7 +500,7 @@ def register_shared_discussion_tools(mcp: FastMCP):
 
         # Method 1: Try to get entry details from the discussion view endpoint
         entry_response = None
-        replies = []
+        replies: list[Any] | Any = []
 
         try:
             # First try the discussion view endpoint which includes all entries
@@ -496,17 +612,26 @@ def register_shared_discussion_tools(mcp: FastMCP):
         updated_at = format_date(entry_response.get("updated_at"))
         read_state = entry_response.get("read_state", "unknown")
 
-        result = f"Discussion Entry Details for '{topic_title}' in Course {course_display}:\n\n"
+        result = (
+            f"Discussion Entry Details in Course {course_display} — topic title:\n"
+            f"{fence_untrusted(topic_title, 'discussion topic title')}\n\n"
+        )
         result += f"Topic ID: {topic_id}\n"
         result += f"Entry ID: {entry_id}\n"
-        result += f"Author: {user_name} (ID: {user_id})\n"
+        result += f"Author: {fence_untrusted_inline(user_name, 'author name')} (ID: {user_id})\n"
         result += f"Posted: {created_at}\n"
 
         if updated_at != "N/A" and updated_at != created_at:
             result += f"Updated: {updated_at}\n"
 
         result += f"Read State: {read_state.title()}\n"
-        result += f"\nContent:\n{message}\n"
+        # Student-authored, returned raw, and post_discussion_entry lives in
+        # the same shared toolset — the highest-risk read→write loop in the
+        # issue-239 audit. Provenance must be explicit.
+        result += (
+            "\nContent:\n"
+            f"{fence_untrusted(message, 'discussion entry by a course participant')}\n"
+        )
 
         # Format replies
         if include_replies:
@@ -522,9 +647,12 @@ def register_shared_discussion_tools(mcp: FastMCP):
 
                     result += f"\nReply #{i}:\n"
                     result += f"Reply ID: {reply_id}\n"
-                    result += f"Author: {reply_user_name}\n"
+                    result += f"Author: {fence_untrusted_inline(reply_user_name, 'author name')}\n"
                     result += f"Posted: {reply_created_at}\n"
-                    result += f"Content:\n{reply_message}\n"
+                    result += (
+                        "Content:\n"
+                        f"{fence_untrusted(reply_message, 'discussion reply by a course participant')}\n"
+                    )
             else:
                 result += "\nNo replies found for this entry."
         else:
@@ -532,12 +660,19 @@ def register_shared_discussion_tools(mcp: FastMCP):
 
         return result
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_discussion_with_replies(course_identifier: str | int,
                                         topic_id: str | int,
                                         include_replies: bool = False) -> str:
-        """Enhanced function to get discussion entries with optional reply fetching.
+        """Read a discussion topic's title and a preview of every entry.
+
+        Returns the topic title (not its body) and each top-level entry's author,
+        post time, and a text preview cut to 200 characters; with
+        include_replies=True each entry's replies are fetched too, also as
+        previews. For full entry text use list_discussion_entries with
+        include_full_content=True, and get_discussion_entry_details for a single
+        entry.
 
         Args:
             course_identifier: Course code or Canvas ID
@@ -568,7 +703,10 @@ def register_shared_discussion_tools(mcp: FastMCP):
             topic_title = topic_response.get("title", "Unknown Topic")
 
         course_display = await get_course_code(course_id) or course_identifier
-        result = f"Discussion '{topic_title}' in Course {course_display}:\n\n"
+        result = (
+            f"Discussion in Course {course_display} — topic title:\n"
+            f"{fence_untrusted(topic_title, 'discussion topic title')}\n\n"
+        )
 
         # Process each entry
         for entry in entries:
@@ -586,13 +724,16 @@ def register_shared_discussion_tools(mcp: FastMCP):
             else:
                 message_preview = "[No content]"
 
-            result += f"📝 Entry {entry_id} by {user_name}\n"
+            result += f"📝 Entry {entry_id} by {fence_untrusted_inline(user_name, 'author name')}\n"
             result += f"   Posted: {created_at}\n"
-            result += f"   Content: {message_preview}\n"
+            result += (
+                "   Content: "
+                f"{fence_untrusted(message_preview, 'discussion entry by a course participant')}\n"
+            )
 
             # Handle replies
             if include_replies:
-                replies = []
+                replies: list[Any] | Any = []
 
                 # Method 1: Check recent_replies from the entry
                 recent_replies = entry.get("recent_replies", [])
@@ -636,7 +777,10 @@ def register_shared_discussion_tools(mcp: FastMCP):
                         else:
                             reply_preview = "[No content]"
 
-                        result += f"      └─ Reply {i} by {reply_user} ({reply_created}): {reply_preview}\n"
+                        result += (
+                            f"      └─ Reply {i} by {fence_untrusted_inline(reply_user, 'author name')} ({reply_created}): "
+                            f"{fence_untrusted(reply_preview, 'discussion reply by a course participant')}\n"
+                        )
                 else:
                     recent_count = len(entry.get("recent_replies", []))
                     has_more = entry.get("has_more_replies", False)
@@ -660,18 +804,28 @@ def register_shared_discussion_tools(mcp: FastMCP):
 
         return result
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=False, idempotent_hint=False))
     @validate_params
     async def post_discussion_entry(course_identifier: str | int,
                                   topic_id: str | int,
                                   message: str) -> str:
         """Post a new top-level entry to a discussion topic.
 
+        Posts immediately as the token owner and is visible to everyone who can
+        see the topic. Not idempotent: calling twice creates two entries. If
+        create_announcement failed, do not post that content here instead:
+        report the failure, because re-posting it publishes the message
+        somewhere the user did not choose.
+
         Args:
             course_identifier: Course code or Canvas ID
             topic_id: Discussion topic ID
             message: Entry message content
         """
+        # Backstop for issue 239: never publish our provenance fence markers.
+        if contains_fence_markers(message):
+            return FENCE_LEAK_ERROR
+
         course_id = await get_course_id(course_identifier)
 
         # Prepare the entry data
@@ -714,7 +868,7 @@ def register_shared_discussion_tools(mcp: FastMCP):
 
         return result
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=False, idempotent_hint=False))
     @validate_params
     async def reply_to_discussion_entry(course_identifier: str | int,
                                       topic_id: str | int,
@@ -728,6 +882,10 @@ def register_shared_discussion_tools(mcp: FastMCP):
             entry_id: Discussion entry ID to reply to
             message: Reply message content
         """
+        # Backstop for issue 239: never publish our provenance fence markers.
+        if contains_fence_markers(message):
+            return FENCE_LEAK_ERROR
+
         course_id = await get_course_id(course_identifier)
 
         # Ensure IDs are strings
@@ -757,10 +915,10 @@ def register_shared_discussion_tools(mcp: FastMCP):
                f"Message: {truncate_text(message, 200)}"
 
 
-def register_educator_discussion_tools(mcp: FastMCP):
+def register_educator_discussion_tools(mcp: FastMCP) -> None:
     """Register educator-only discussion and announcement tools."""
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=False, idempotent_hint=False))
     @validate_params
     async def create_discussion_topic(course_identifier: str | int,
                                     title: str,
@@ -769,7 +927,16 @@ def register_educator_discussion_tools(mcp: FastMCP):
                                     lock_at: str | None = None,
                                     require_initial_post: bool = False,
                                     pinned: bool = False) -> str:
-        """Create a new discussion topic for a course.
+        """Create and publish a discussion topic in a course.
+
+        The topic is always created published (there is no draft option here),
+        so students can see it on creation unless delayed_post_at schedules it
+        for later. Unpublishing afterwards with update_discussion_topic does not
+        undo that initial visibility; if the topic must not be seen yet, use
+        delayed_post_at or confirm with the user first.
+        If create_announcement failed, do not post that content here instead:
+        report the failure, because re-posting it publishes the message
+        somewhere the user did not choose.
 
         Args:
             course_identifier: Course code or Canvas ID
@@ -780,6 +947,10 @@ def register_educator_discussion_tools(mcp: FastMCP):
             require_initial_post: Students must post before seeing others (default: False)
             pinned: Pin this discussion topic (default: False)
         """
+        # Backstop for issue 239: never publish our provenance fence markers.
+        if contains_fence_markers(message) or contains_fence_markers(title):
+            return FENCE_LEAK_ERROR
+
         course_id = await get_course_id(course_identifier)
 
         data = {
@@ -813,53 +984,132 @@ def register_educator_discussion_tools(mcp: FastMCP):
                f"Title: {topic_title}\n" + \
                f"Created: {created_at}"
 
-    # ===== ANNOUNCEMENT TOOLS =====
-
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
     @validate_params
-    async def list_announcements(course_identifier: str) -> str:
-        """List announcements for a specific course.
+    async def update_discussion_topic(
+        course_identifier: str | int,
+        topic_id: str | int,
+        title: str | None = None,
+        message: str | None = None,
+        published: bool | None = None,
+        pinned: bool | None = None,
+        locked: bool | None = None,
+        delayed_post_at: str | None = None,
+        lock_at: str | None = None,
+        require_initial_post: bool | None = None,
+    ) -> str:
+        """Update an existing discussion topic or announcement.
 
         Args:
             course_identifier: Course code or Canvas ID
+            topic_id: Discussion topic ID
+            title: New title
+            message: New body content (HTML supported)
+            published: Publish or unpublish the topic
+            pinned: Pin or unpin the topic
+            locked: Lock or unlock the topic
+            delayed_post_at: ISO 8601 datetime to schedule posting
+            lock_at: ISO 8601 datetime to auto-lock the discussion
+            require_initial_post: Students must post before seeing others
         """
         course_id = await get_course_id(course_identifier)
 
-        params = {
-            "include[]": ["announcement"],
-            "only_announcements": True,
-            "per_page": 100
-        }
+        # Backstop for issue 239: never publish our provenance fence markers.
+        if (message is not None and contains_fence_markers(message)) or (
+            title is not None and contains_fence_markers(title)
+        ):
+            return FENCE_LEAK_ERROR
 
-        announcements = await fetch_all_paginated_results(f"/courses/{course_id}/discussion_topics", params)
+        data: dict[str, str | bool] = {}
 
-        if isinstance(announcements, dict) and "error" in announcements:
-            return f"Error fetching announcements: {announcements['error']}"
+        if title is not None:
+            data["title"] = title
 
-        if not announcements:
-            return f"No announcements found for course {course_identifier}."
+        if message is not None:
+            data["message"] = message
 
-        announcements_info = []
-        for announcement in announcements:
-            announcement_id = announcement.get("id")
-            title = announcement.get("title", "Untitled announcement")
-            posted_at = format_date(announcement.get("posted_at"))
+        if published is not None:
+            data["published"] = published
 
-            announcements_info.append(
-                f"ID: {announcement_id}\nTitle: {title}\nPosted: {posted_at}\n"
+        if pinned is not None:
+            data["pinned"] = pinned
+
+        if locked is not None:
+            data["locked"] = locked
+
+        if require_initial_post is not None:
+            data["require_initial_post"] = require_initial_post
+
+        if delayed_post_at is not None:
+            parsed_delayed = parse_date(delayed_post_at)
+            if not parsed_delayed:
+                return (
+                    f"Invalid date format for delayed_post_at: '{delayed_post_at}'. "
+                    "Use ISO 8601 format (e.g., '2026-01-26T12:00:00Z')."
+                )
+            data["delayed_post_at"] = parsed_delayed.isoformat()
+
+        if lock_at is not None:
+            parsed_lock = parse_date(lock_at)
+            if not parsed_lock:
+                return (
+                    f"Invalid date format for lock_at: '{lock_at}'. "
+                    "Use ISO 8601 format (e.g., '2026-02-01T23:59:00Z')."
+                )
+            data["lock_at"] = parsed_lock.isoformat()
+
+        if not data:
+            return (
+                "No fields provided to update. Specify at least one field to modify "
+                "(e.g., title, message, published, pinned, locked)."
             )
 
-        course_display = await get_course_code(course_id) or course_identifier
-        return f"Announcements for Course {course_display}:\n\n" + "\n".join(announcements_info)
+        response = await make_canvas_request(
+            "put",
+            f"/courses/{course_id}/discussion_topics/{topic_id}",
+            data=data,
+        )
 
-    @mcp.tool()
+        if "error" in response:
+            return f"Error updating discussion topic: {response['error']}"
+
+        updated_title = response.get("title", "")
+        is_announcement = response.get("is_announcement", False)
+        updated_published = response.get("published", False)
+        topic_type = "Announcement" if is_announcement else "Discussion"
+
+        course_display = await get_course_code(course_id) or course_identifier
+        updated_fields = list(data.keys())
+
+        result = f"✅ {topic_type} updated successfully!\n\n"
+        result += f"**{updated_title}**\n"
+        result += f"  Course: {course_display}\n"
+        result += f"  Topic ID: {topic_id}\n"
+        result += f"  Type: {topic_type}\n"
+        result += f"  Updated fields: {', '.join(updated_fields)}\n"
+        result += f"  Published: {'Yes' if updated_published else 'No'}\n"
+
+        return result
+
+    # ===== ANNOUNCEMENT TOOLS =====
+
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=False, idempotent_hint=False))
     @validate_params
     async def create_announcement(course_identifier: str | int,
                                 title: str,
                                 message: str,
                                 delayed_post_at: str | None = None,
                                 lock_at: str | None = None) -> str:
-        """Create a new announcement for a course with optional scheduling.
+        """Create and publish a course announcement.
+
+        The announcement is published on creation: without delayed_post_at it
+        posts immediately, and Canvas may notify enrolled users depending on
+        their notification settings. Deleting the announcement afterwards does
+        not recall notifications already delivered. Requires Canvas permission
+        to post announcements in the course. If
+        Canvas refuses, the tool reports the failure; announcement content is
+        not re-posted through the discussion tools, because that would publish
+        it somewhere the user did not choose.
 
         Args:
             course_identifier: Course code or Canvas ID
@@ -868,7 +1118,31 @@ def register_educator_discussion_tools(mcp: FastMCP):
             delayed_post_at: ISO 8601 datetime to schedule posting
             lock_at: ISO 8601 datetime to auto-lock the announcement
         """
+        # Backstop for issue 239: never publish our provenance fence markers.
+        if contains_fence_markers(message) or contains_fence_markers(title):
+            return FENCE_LEAK_ERROR
+
         course_id = await get_course_id(course_identifier)
+
+        # Pre-check (#283): the single-course endpoint reports whether this
+        # token may create announcements here. Measured live 2026-08-14:
+        # only /courses/:id?include[]=permissions carries these two flags —
+        # the list endpoint ignores the include and the dedicated
+        # /permissions endpoint omits them. Refuse only on an explicit
+        # False; any other shape (error, missing key) falls open to the
+        # post-create backstop below.
+        course_info = await make_canvas_request(
+            "get", f"/courses/{course_id}", params={"include[]": "permissions"}
+        )
+        if isinstance(course_info, dict) and "error" not in course_info:
+            permissions = course_info.get("permissions")
+            if isinstance(permissions, dict) and permissions.get("create_announcement") is False:
+                return (
+                    "Error creating announcement: your Canvas token does not have "
+                    "permission to create announcements in this course (checked "
+                    "via the course permissions API before posting anything).\n\n"
+                    f"{ANNOUNCEMENT_PERMISSION_FALLBACK_WARNING}"
+                )
 
         data = {
             "title": title,
@@ -888,200 +1162,90 @@ def register_educator_discussion_tools(mcp: FastMCP):
         )
 
         if "error" in response:
-            return f"Error creating announcement: {response['error']}"
+            error_text = str(response["error"])
+            if _is_permission_error(error_text):
+                return (
+                    f"Error creating announcement: {error_text}\n\n"
+                    f"{ANNOUNCEMENT_PERMISSION_FALLBACK_WARNING}"
+                )
+            return f"Error creating announcement: {error_text}"
 
         announcement_id = response.get("id")
         announcement_title = response.get("title", title)
         created_at = format_date(response.get("created_at"))
 
         course_display = await get_course_code(course_id) or course_identifier
+
+        # Canvas answers 200 to this POST even when the token lacks
+        # announcement permission — it silently drops is_announcement and
+        # creates a regular discussion topic instead (#220). The response
+        # echoes the flag (measured live), so its absence means the write
+        # did not do what was asked. Backstop to the pre-check above: clean
+        # up the unintended topic instead of leaving it visible (#283).
+        if not response.get("is_announcement"):
+            cleanup_note = (
+                "Canvas did not return a topic ID, so automatic cleanup could "
+                "not be attempted; check the course and delete the topic in "
+                "Canvas if it was unintended."
+            )
+            if announcement_id is not None:
+                cleanup_note = (
+                    "Automatic cleanup of the topic did not succeed, so it is "
+                    "visible to the course; delete it in Canvas if it was "
+                    "unintended."
+                )
+                delete_response = await make_canvas_request(
+                    "delete", f"/courses/{course_id}/discussion_topics/{announcement_id}"
+                )
+                # A null 200 body would surface here as None — treat any
+                # non-dict as unconfirmed cleanup, never claim the delete
+                # succeeded (and never crash on `in`).
+                if isinstance(delete_response, dict) and "error" not in delete_response:
+                    return (
+                        "Error creating announcement: Canvas ignored "
+                        "is_announcement and created a regular discussion topic "
+                        "instead — this usually means your token lacks permission "
+                        "to post announcements in this course (e.g. a student "
+                        f"account). The unintended topic (ID: {announcement_id}) "
+                        "was deleted automatically; nothing is visible to the "
+                        "course.\n\n"
+                        f"{ANNOUNCEMENT_PERMISSION_FALLBACK_WARNING}"
+                    )
+            return unconfirmed_write_warning(
+                "the announcement was created",
+                {
+                    "Created instead": f"a regular discussion topic (ID: {announcement_id})",
+                    "Course": course_display,
+                    "Title": announcement_title,
+                },
+                "Canvas ignored is_announcement — this usually means your token "
+                "lacks permission to post announcements in this course (e.g. a "
+                f"student account). {cleanup_note}",
+            )
+
         return f"Announcement created successfully in course {course_display}:\n\n" + \
                f"ID: {announcement_id}\n" + \
                f"Title: {announcement_title}\n" + \
                f"Created: {created_at}"
 
     # ===== ANNOUNCEMENT DELETION TOOLS =====
+    #
+    # Every delete is two-step (#318): the first call previews the exact
+    # target(s) and returns a single-use confirmation token bound to what it
+    # showed; only a second call carrying that token deletes. If the target
+    # changed in between (retitled, a different match set), the token stops
+    # matching and nothing is deleted. The un-tokened delete_announcement was
+    # retired in the same pass.
 
-    @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
-    @validate_params
-    async def delete_announcement(
-        course_identifier: str | int,
-        announcement_id: str | int
-    ) -> str:
-        """Delete an announcement from a Canvas course.
-
-        Permanent — Canvas may retain a recycle-bin copy depending on admin settings.
-
-        Args:
-            course_identifier: Course code or Canvas ID
-            announcement_id: Announcement ID to delete
-        """
-        course_id = await get_course_id(course_identifier)
-
-        # First, get the announcement details to return meaningful information
-        announcement = await make_canvas_request(
-            "get", f"/courses/{course_id}/discussion_topics/{announcement_id}"
-        )
-
-        if "error" in announcement:
-            return f"Error fetching announcement details: {announcement['error']}"
-
-        announcement_title = announcement.get("title", "Unknown Title")
-
-        # Proceed with deletion
-        response = await make_canvas_request(
-            "delete", f"/courses/{course_id}/discussion_topics/{announcement_id}"
-        )
-
-        if "error" in response:
-            return f"Error deleting announcement '{announcement_title}': {response['error']}"
-
-        course_display = await get_course_code(course_id) or course_identifier
-        return f"Announcement deleted successfully from course {course_display}:\n\n" + \
-               f"ID: {announcement_id}\n" + \
-               f"Title: {announcement_title}\n" + \
-               "Status: deleted\n" + \
-               "Message: Announcement deleted successfully"
-
-    @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
-    @validate_params
-    async def bulk_delete_announcements(
-        course_identifier: str | int,
-        announcement_ids: list[str | int],
-        stop_on_error: bool = False,
-        limit: int = 25,
-        dry_run: bool = False
-    ) -> str:
-        """Delete multiple announcements from a Canvas course.
-
-        Permanent — Canvas may retain a recycle-bin copy depending on admin settings.
-
-        Args:
-            course_identifier: Course code or Canvas ID
-            announcement_ids: List of announcement IDs to delete
-            stop_on_error: Stop on first error; if False, continue with remaining (default: False)
-            limit: Max number of announcements to delete in one call (default: 25). Ignored when dry_run=True, so large batches can be previewed safely.
-            dry_run: Fetch titles and report what would be deleted without deleting (default: False)
-        """
-        course_id = await get_course_id(course_identifier)
-
-        if not dry_run and len(announcement_ids) > limit:
-            return (
-                f"❌ Refusing to delete {len(announcement_ids)} announcements: exceeds limit of {limit}.\n"
-                f"  Pass limit={len(announcement_ids)} (or higher) to override, "
-                f"or use dry_run=True to preview without deleting."
-            )
-
-        successful = []
-        failed = []
-        previewed = []
-
-        for announcement_id in announcement_ids:
-            try:
-                # Get announcement details first
-                announcement = await make_canvas_request(
-                    "get", f"/courses/{course_id}/discussion_topics/{announcement_id}"
-                )
-
-                if "error" in announcement:
-                    failed.append({
-                        "id": str(announcement_id),
-                        "error": announcement["error"],
-                        "message": "Failed to fetch announcement details"
-                    })
-                    if stop_on_error:
-                        break
-                    continue
-
-                if dry_run:
-                    previewed.append({
-                        "id": str(announcement_id),
-                        "title": announcement.get("title", "Unknown Title")
-                    })
-                    continue
-
-                # Proceed with deletion
-                response = await make_canvas_request(
-                    "delete", f"/courses/{course_id}/discussion_topics/{announcement_id}"
-                )
-
-                if "error" in response:
-                    failed.append({
-                        "id": str(announcement_id),
-                        "title": announcement.get("title", "Unknown Title"),
-                        "error": response["error"],
-                        "message": "Failed to delete announcement"
-                    })
-                    if stop_on_error:
-                        break
-                else:
-                    successful.append({
-                        "id": str(announcement_id),
-                        "title": announcement.get("title", "Unknown Title")
-                    })
-
-            except Exception as e:
-                failed.append({
-                    "id": str(announcement_id),
-                    "error": str(e),
-                    "message": "Unexpected error during deletion"
-                })
-                if stop_on_error:
-                    break
-
-        # Format results
-        course_display = await get_course_code(course_id) or course_identifier
-
-        if dry_run:
-            result = f"DRY RUN — bulk deletion preview for course {course_display}:\n\n"
-            result += f"Summary: {len(previewed)} would be deleted, {len(failed)} unreachable out of {len(announcement_ids)} total\n\n"
-            if previewed:
-                result += "Would delete:\n"
-                for item in previewed:
-                    result += f"  - ID: {item['id']}, Title: {item['title']}\n"
-                result += "\n"
-            if failed:
-                result += "Could not preview (fetch failed):\n"
-                for item in failed:
-                    result += f"  - ID: {item['id']}, Error: {item['error']}\n"
-                result += "\n"
-            result += "Set dry_run=False to perform actual deletions."
-            return result
-
-        summary = {
-            "total": len(announcement_ids),
-            "successful": len(successful),
-            "failed": len(failed)
-        }
-
-        result = f"Bulk deletion results for course {course_display}:\n\n"
-        result += f"Summary: {summary['successful']} successful, {summary['failed']} failed out of {summary['total']} total\n\n"
-
-        if successful:
-            result += "Successfully deleted:\n"
-            for item in successful:
-                result += f"  - ID: {item['id']}, Title: {item['title']}\n"
-            result += "\n"
-
-        if failed:
-            result += "Failed to delete:\n"
-            for item in failed:
-                result += f"  - ID: {item['id']}"
-                if 'title' in item:
-                    result += f", Title: {item['title']}"
-                result += f", Error: {item['error']}\n"
-
-        return result
-
-    @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
     @validate_params
     async def delete_announcement_with_confirmation(
         course_identifier: str | int,
         announcement_id: str | int,
         require_title_match: str | None = None,
-        dry_run: bool = False
+        confirmation_token: str | None = None
     ) -> str:
-        """Delete an announcement with optional safety checks.
+        """Delete an announcement. Two-step: preview first, then confirm with the token.
 
         Permanent — Canvas may retain a recycle-bin copy depending on admin settings.
 
@@ -1089,67 +1253,194 @@ def register_educator_discussion_tools(mcp: FastMCP):
             course_identifier: Course code or Canvas ID
             announcement_id: Announcement ID to delete
             require_title_match: Only delete if title matches this string exactly
-            dry_run: Verify but don't actually delete (default: False)
+            confirmation_token: Token from the preview call; omit to preview
         """
         course_id = await get_course_id(course_identifier)
 
-        # First fetch the announcement details
         announcement = await make_canvas_request(
             "get", f"/courses/{course_id}/discussion_topics/{announcement_id}"
         )
-
         if "error" in announcement:
             return f"Error fetching announcement details: {announcement['error']}"
 
+        # actual_title stays raw for the comparison and the fingerprint;
+        # fenced only at the display boundary (issue 239).
         actual_title = announcement.get("title", "Unknown Title")
-        title_matched = True
+        shown_title = fence_untrusted(actual_title, "announcement title")
+        if require_title_match is not None and actual_title != require_title_match:
+            return (
+                f"Title mismatch - Expected: '{require_title_match}', Actual:\n"
+                f"{shown_title}\nDeletion aborted for safety."
+            )
 
-        # Check title match if required
-        if require_title_match is not None:
-            title_matched = actual_title == require_title_match
-            if not title_matched:
-                return f"Title mismatch - Expected: '{require_title_match}', Actual: '{actual_title}'. Deletion aborted for safety."
+        course_display = await get_course_code(course_id) or course_identifier
+        fingerprint = _DELETE_ANNOUNCEMENT_GUARD.fingerprint(
+            "delete_announcement_with_confirmation",
+            str(course_id), str(announcement_id), actual_title,
+        )
+        if not confirmation_token:
+            preview = (
+                f"Would delete announcement from course {course_display}:\n\n"
+                f"ID: {announcement_id}\n"
+                f"Title:\n{shown_title}"
+            )
+            return preview_with_token(
+                _DELETE_ANNOUNCEMENT_GUARD, fingerprint,
+                "delete_announcement_with_confirmation", preview,
+            )
+        error = redeem_confirmation(_DELETE_ANNOUNCEMENT_GUARD, confirmation_token, fingerprint)
+        if error:
+            return error
 
-        # Handle dry run
-        if dry_run:
-            course_display = await get_course_code(course_id) or course_identifier
-            result = f"DRY RUN - Would delete announcement from course {course_display}:\n\n"
-            result += f"ID: {announcement_id}\n"
-            result += f"Title: {actual_title}\n"
-            result += "Status: dry_run\n"
-            result += "Message: Announcement would be deleted (dry run mode)\n"
-            if require_title_match:
-                result += f"Title matched: {title_matched}\n"
-            return result
-
-        # Proceed with actual deletion
         response = await make_canvas_request(
             "delete", f"/courses/{course_id}/discussion_topics/{announcement_id}"
         )
-
         if "error" in response:
-            return f"Error deleting announcement '{actual_title}': {response['error']}"
+            return f"Error deleting announcement {shown_title}: {response['error']}"
 
-        course_display = await get_course_code(course_id) or course_identifier
         result = f"Announcement deleted successfully from course {course_display}:\n\n"
         result += f"ID: {announcement_id}\n"
-        result += f"Title: {actual_title}\n"
+        result += f"Title:\n{shown_title}\n"
         result += "Status: deleted\n"
-        result += "Message: Announcement deleted successfully\n"
-        if require_title_match:
-            result += f"Title matched: {title_matched}\n"
-
+        if require_title_match is not None:
+            result += "Title matched: True\n"
         return result
 
-    @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
+    @validate_params
+    async def bulk_delete_announcements(
+        course_identifier: str | int,
+        announcement_ids: list[str | int],
+        stop_on_error: bool = False,
+        limit: int = 25,
+        confirmation_token: str | None = None
+    ) -> str:
+        """Delete multiple announcements by ID. Two-step: preview first, then confirm with the token.
+
+        Permanent — Canvas may retain a recycle-bin copy depending on admin settings.
+
+        Args:
+            course_identifier: Course code or Canvas ID
+            announcement_ids: List of announcement IDs to delete
+            stop_on_error: Stop at the first failed deletion; if False, continue with the rest (default: False). Applies to the delete phase only; the preview resolves every id regardless
+            limit: Max number of announcements per call (default: 25); pass a higher value to override
+            confirmation_token: Token from the preview call; omit to preview
+        """
+        course_id = await get_course_id(course_identifier)
+
+        if len(announcement_ids) > limit:
+            return (
+                f"❌ Refusing to delete {len(announcement_ids)} announcements: exceeds limit of {limit}.\n"
+                f"  Pass limit={len(announcement_ids)} (or higher) to override."
+            )
+
+        # Resolve every id up front: the preview must show exactly what the
+        # token will authorize, titles included.
+        found: list[dict[str, str]] = []
+        unreachable: list[dict[str, str]] = []
+        for announcement_id in announcement_ids:
+            announcement = await make_canvas_request(
+                "get", f"/courses/{course_id}/discussion_topics/{announcement_id}"
+            )
+            if "error" in announcement:
+                unreachable.append({"id": str(announcement_id), "error": announcement["error"]})
+                continue
+            found.append({
+                "id": str(announcement_id),
+                "title": announcement.get("title", "Unknown Title"),
+            })
+
+        course_display = await get_course_code(course_id) or course_identifier
+        # Binds the behavioural arguments too: a confirm that flips
+        # stop_on_error or limit is a different request than the preview.
+        # ...and the ids as requested, not just the resolved ones: swapping one
+        # unreachable id for another must not redeem the old token.
+        fingerprint = _BULK_DELETE_GUARD.fingerprint(
+            "bulk_delete_announcements", str(course_id),
+            str(stop_on_error), str(limit),
+            json.dumps([str(i) for i in announcement_ids]),
+            json.dumps([[item["id"], item["title"]] for item in found]),
+        )
+
+        if not confirmation_token:
+            preview = f"Bulk deletion preview for course {course_display}:\n\n"
+            preview += (
+                f"Summary: {len(found)} would be deleted, {len(unreachable)} unreachable "
+                f"out of {len(announcement_ids)} total\n\n"
+            )
+            if found:
+                preview += "Would delete:\n"
+                for item in found:
+                    preview += (
+                        f"  - ID: {item['id']}, Title: "
+                        f"{fence_untrusted(item['title'], 'announcement title')}\n"
+                    )
+                preview += "\n"
+            if unreachable:
+                preview += "Unreachable (fetch failed, will be skipped):\n"
+                for item in unreachable:
+                    preview += f"  - ID: {item['id']}, Error: {item['error']}\n"
+            if not found:
+                return preview + "\nNothing to delete."
+            return preview_with_token(
+                _BULK_DELETE_GUARD, fingerprint, "bulk_delete_announcements", preview
+            )
+
+        error = redeem_confirmation(_BULK_DELETE_GUARD, confirmation_token, fingerprint)
+        if error:
+            return error
+
+        successful: list[dict[str, str]] = []
+        failed: list[dict[str, str]] = list(unreachable)
+        for item in found:
+            shown = fence_untrusted(item["title"], "announcement title")
+            try:
+                response = await make_canvas_request(
+                    "delete", f"/courses/{course_id}/discussion_topics/{item['id']}"
+                )
+            except Exception as e:  # noqa: BLE001 - per-item isolation
+                failed.append({"id": item["id"], "title": shown, "error": str(e)})
+                if stop_on_error:
+                    break
+                continue
+            if "error" in response:
+                failed.append({"id": item["id"], "title": shown, "error": response["error"]})
+                if stop_on_error:
+                    break
+            else:
+                successful.append({"id": item["id"], "title": shown})
+
+        result = f"Bulk deletion results for course {course_display}:\n\n"
+        result += (
+            f"Summary: {len(successful)} successful, {len(failed)} failed "
+            f"out of {len(announcement_ids)} total\n\n"
+        )
+        if successful:
+            result += "Successfully deleted:\n"
+            for item in successful:
+                result += f"  - ID: {item['id']}, Title: {item['title']}\n"
+            result += "\n"
+        if failed:
+            result += "Failed to delete:\n"
+            for item in failed:
+                result += f"  - ID: {item['id']}"
+                if "title" in item:
+                    result += f", Title: {item['title']}"
+                result += f", Error: {item['error']}\n"
+        return result
+
+    # Idempotent since #318: the token is bound to the exact matched id set and
+    # is single-use, so an identical retry either previews (no token) or is
+    # refused (spent token) — it can no longer delete the NEXT batch.
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
     @validate_params
     async def delete_announcements_by_criteria(
         course_identifier: str | int,
         criteria: dict,
         limit: int | None = None,
-        dry_run: bool = True
+        confirmation_token: str | None = None
     ) -> str:
-        """Delete announcements matching specific criteria.
+        """Delete announcements matching criteria. Two-step: preview first, then confirm with the token.
 
         Permanent — Canvas may retain a recycle-bin copy depending on admin settings.
 
@@ -1157,39 +1448,33 @@ def register_educator_discussion_tools(mcp: FastMCP):
             course_identifier: Course code or Canvas ID
             criteria: Dict with keys: title_contains, older_than (ISO), newer_than (ISO), title_regex
             limit: Max number of announcements to delete (safety limit)
-            dry_run: Show what would be deleted without deleting (default: True)
+            confirmation_token: Token from the preview call; omit to preview
         """
         course_id = await get_course_id(course_identifier)
 
-        # First list all announcements
         params = {
-            "include[]": ["announcement"],
+            # only_announcements is the filter Canvas honours. include[]=announcement
+            # is NOT a supported include value and is silently ignored (issue #238);
+            # measured identical result sets with and without it.
             "only_announcements": True,
             "per_page": 100
         }
-
         announcements = await fetch_all_paginated_results(f"/courses/{course_id}/discussion_topics", params)
-
         if isinstance(announcements, dict) and "error" in announcements:
             return f"Error fetching announcements: {announcements['error']}"
-
         if not announcements:
             return f"No announcements found for course {course_identifier}."
 
-        # Filter based on criteria
         matched = []
-
         for announcement in announcements:
             match = True
             announcement_title = announcement.get("title", "")
             posted_at_str = announcement.get("posted_at")
 
-            # Check title_contains
             if "title_contains" in criteria:
                 if criteria["title_contains"].lower() not in announcement_title.lower():
                     match = False
 
-            # Check title_regex
             if "title_regex" in criteria and match:
                 try:
                     if not re.search(criteria["title_regex"], announcement_title, re.IGNORECASE):
@@ -1197,7 +1482,6 @@ def register_educator_discussion_tools(mcp: FastMCP):
                 except re.error:
                     return f"Invalid regex pattern: {criteria['title_regex']}"
 
-            # Check date criteria
             if posted_at_str and match:
                 posted_at = parse_date(posted_at_str)
                 if not posted_at:
@@ -1222,76 +1506,72 @@ def register_educator_discussion_tools(mcp: FastMCP):
             if match:
                 matched.append(announcement)
 
-        # Apply limit if specified
         limit_reached = False
         if limit and len(matched) > limit:
             matched = matched[:limit]
             limit_reached = True
 
         course_display = await get_course_code(course_id) or course_identifier
-        result = f"Criteria-based deletion results for course {course_display}:\n\n"
-        result += f"Search criteria: {json.dumps(criteria, indent=2)}\n\n"
-        result += f"Matched {len(matched)} announcements"
+        header = f"Criteria-based deletion for course {course_display}:\n\n"
+        header += f"Search criteria: {json.dumps(criteria, indent=2)}\n\n"
+        header += f"Matched {len(matched)} announcements"
         if limit_reached:
-            result += f" (limited to {limit})"
-        result += "\n\n"
+            header += f" (limited to {limit})"
+        header += "\n\n"
 
         if not matched:
-            result += "No announcements matched the specified criteria."
-            return result
+            return header + "No announcements matched the specified criteria."
 
-        # Show what was matched
-        result += "Matched announcements:\n"
+        listing = "Matched announcements:\n"
         for announcement in matched:
-            result += f"  - ID: {announcement.get('id')}, Title: {announcement.get('title', 'Untitled')}, Posted: {format_date(announcement.get('posted_at'))}\n"
-        result += "\n"
+            listing += (
+                f"  - ID: {announcement.get('id')}, Title: "
+                f"{fence_untrusted(announcement.get('title', 'Untitled'), 'announcement title')}, "
+                f"Posted: {format_date(announcement.get('posted_at'))}\n"
+            )
 
-        if dry_run:
-            result += "DRY RUN: No announcements were actually deleted.\n"
-            result += "Set dry_run=False to perform actual deletions."
-            return result
+        # Bound to the criteria AND the exact match set (ids + titles), so a
+        # listing that drifted since the preview refuses instead of deleting
+        # something the user never saw.
+        fingerprint = _CRITERIA_DELETE_GUARD.fingerprint(
+            "delete_announcements_by_criteria", str(course_id),
+            json.dumps(criteria, sort_keys=True, default=str), str(limit),
+            json.dumps([[str(a.get("id")), a.get("title", ""), str(a.get("posted_at"))] for a in matched]),
+        )
+        if not confirmation_token:
+            return preview_with_token(
+                _CRITERIA_DELETE_GUARD, fingerprint,
+                "delete_announcements_by_criteria", header + listing,
+            )
+        error = redeem_confirmation(_CRITERIA_DELETE_GUARD, confirmation_token, fingerprint)
+        if error:
+            return error
 
-        # Perform actual deletions
         deleted = []
         failed = []
-
         for announcement in matched:
             announcement_id = announcement.get("id")
+            shown = fence_untrusted(announcement.get("title", "Unknown Title"), "announcement title")
             try:
                 response = await make_canvas_request(
                     "delete", f"/courses/{course_id}/discussion_topics/{announcement_id}"
                 )
-
                 if "error" in response:
-                    failed.append({
-                        "id": str(announcement_id),
-                        "title": announcement.get("title", "Unknown Title"),
-                        "error": response["error"]
-                    })
+                    failed.append({"id": str(announcement_id), "title": shown, "error": response["error"]})
                 else:
-                    deleted.append({
-                        "id": str(announcement_id),
-                        "title": announcement.get("title", "Unknown Title")
-                    })
+                    deleted.append({"id": str(announcement_id), "title": shown})
+            except Exception as e:  # noqa: BLE001 - per-item isolation
+                failed.append({"id": str(announcement_id), "title": shown, "error": str(e)})
 
-            except Exception as e:
-                failed.append({
-                    "id": str(announcement_id),
-                    "title": announcement.get("title", "Unknown Title"),
-                    "error": str(e)
-                })
-
+        result = header + listing + "\n"
         result += f"Deletion completed: {len(deleted)} successful, {len(failed)} failed\n\n"
-
         if deleted:
             result += "Successfully deleted:\n"
             for item in deleted:
                 result += f"  - ID: {item['id']}, Title: {item['title']}\n"
             result += "\n"
-
         if failed:
             result += "Failed to delete:\n"
             for item in failed:
                 result += f"  - ID: {item['id']}, Title: {item['title']}, Error: {item['error']}\n"
-
         return result

@@ -1,15 +1,14 @@
 """Tests for role-based tool filtering."""
 
 import pytest
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from canvas_mcp.server import register_all_tools
 
 
 async def _get_tool_names(mcp: FastMCP) -> set[str]:
     """Extract registered tool names from a FastMCP instance."""
-    tools = await mcp.list_tools()
-    return {t.name for t in tools}
+    return {tool.name for tool in await mcp.list_tools()}
 
 
 STUDENT_ONLY_TOOLS = {
@@ -36,6 +35,9 @@ SHARED_TOOLS = {
     "get_assignment_details",
     # shared discussions
     "list_discussion_topics",
+    # Announcements are student-visible course content and this tool is
+    # read-only, so every role gets an announcements-only listing (issue #238).
+    "list_announcements",
     "get_discussion_topic_details",
     "list_discussion_entries",
     "get_discussion_entry_details",
@@ -55,17 +57,29 @@ SHARED_TOOLS = {
     "mark_conversations_read",
     # discovery
     "search_canvas_tools",
+    # self-identity (issue #171) — caller-scoped, no roster permission needed
+    "get_my_enrollments",
+    "get_my_profile",
 }
+
+# These two answer only about the authenticated caller, so unlike
+# check_enrollment they must be available under EVERY profile.
+SELF_IDENTITY_TOOLS = {"get_my_enrollments", "get_my_profile"}
 
 # A sample of educator-only tools to check (not exhaustive, just representative)
 EDUCATOR_ONLY_SAMPLE = {
     "create_assignment",
     "update_assignment",
     "bulk_grade_submissions",
+    "create_content_migration",
+    "get_content_migration_status",
     "create_announcement",
     "create_module",
     "upload_course_file",
     "create_page",
+    # Writing a syllabus needs an instructor-scoped token, so it must not leak
+    # into the student profile even though its read twin get_syllabus is shared.
+    "update_syllabus",
     "list_users",
     "get_student_analytics",
 }
@@ -163,17 +177,34 @@ class TestRoleFiltering:
         assert not missing, f"Tools in 'all' but missing from student+educator: {missing}"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", ["student", "educator", "all"])
+    async def test_self_identity_tools_registered_for_every_role(self, role):
+        """They need no roster permission, so no profile may omit them (#171)."""
+        mcp = FastMCP(name=f"test-{role}")
+        register_all_tools(mcp, role=role)
+        tools = await _get_tool_names(mcp)
+        for tool in SELF_IDENTITY_TOOLS:
+            assert tool in tools, f"Role '{role}' should include {tool}"
+
+    @pytest.mark.asyncio
+    async def test_check_enrollment_stays_educator_only(self):
+        """Contrast: the roster-reading tool is NOT a self-identity tool."""
+        mcp = FastMCP(name="test-student")
+        register_all_tools(mcp, role="student")
+        assert "check_enrollment" not in await _get_tool_names(mcp)
+
+    @pytest.mark.asyncio
     async def test_student_tool_count(self):
-        """Student role should have approximately 31 tools."""
+        """Student role should have approximately 37 tools."""
         mcp = FastMCP(name="test-student")
         register_all_tools(mcp, role="student")
         tools = await _get_tool_names(mcp)
-        assert 25 <= len(tools) <= 40, f"Expected ~31 student tools, got {len(tools)}: {sorted(tools)}"
+        assert 25 <= len(tools) <= 40, f"Expected ~37 student tools, got {len(tools)}: {sorted(tools)}"
 
     @pytest.mark.asyncio
     async def test_educator_tool_count(self):
-        """Educator role should have approximately 86 tools."""
+        """Educator role should have approximately 88 tools."""
         mcp = FastMCP(name="test-educator")
         register_all_tools(mcp, role="educator")
         tools = await _get_tool_names(mcp)
-        assert 75 <= len(tools) <= 95, f"Expected ~86 educator tools, got {len(tools)}: {sorted(tools)}"
+        assert 75 <= len(tools) <= 95, f"Expected ~88 educator tools, got {len(tools)}: {sorted(tools)}"

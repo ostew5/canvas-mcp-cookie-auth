@@ -1,20 +1,21 @@
 """Admin and developer MCP tools for Canvas API."""
 
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from ..core.anonymization import anonymize_response_data
 from ..core.cache import get_course_code, get_course_id
 from ..core.client import fetch_all_paginated_results, make_canvas_request
-from ..core.logging import log_warning
+from ..core.credentials import is_http_request_active
+from ..core.csv_safety import csv_safe_cell
+from ..core.untrusted_content import fence_untrusted_inline
 from ..core.validation import validate_params
 
 
-def register_admin_tools(mcp: FastMCP):
+def register_admin_tools(mcp: FastMCP) -> None:
     """Register admin/developer MCP tools."""
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     async def get_anonymization_status() -> str:
         """Get current data anonymization status and statistics."""
         from ..core.anonymization import get_anonymization_stats
@@ -26,7 +27,7 @@ def register_admin_tools(mcp: FastMCP):
         result = "🔒 Data Anonymization Status:\n\n"
 
         if config.enable_data_anonymization:
-            result += "✅ **ANONYMIZATION ENABLED** - Student data is protected\n\n"
+            result += "✅ **ANONYMIZATION ENABLED** - Supported identity fields are masked\n\n"
             result += "📊 Session Statistics:\n"
             result += f"  • Total unique students anonymized: {stats['total_anonymized_ids']}\n"
             result += f"  • Privacy protection: {stats['privacy_status']}\n"
@@ -40,19 +41,19 @@ def register_admin_tools(mcp: FastMCP):
                         break
                 result += "\n"
 
-            result += "🛡️ **FERPA Compliance**: Data anonymized before AI processing\n"
-            result += "📍 **Data Location**: All processing happens locally on your machine\n"
+            result += "🛡️ **Privacy Control**: Supported identity fields are anonymized before tool output\n"
+            result += "📍 **Data Path**: Tool results still pass to your configured AI client\n"
 
         else:
-            result += "⚠️ **ANONYMIZATION DISABLED** - Student data is NOT protected\n\n"
-            result += "🚨 **PRIVACY RISK**: Real student names and data sent to AI\n"
-            result += "⚖️ **COMPLIANCE**: May violate FERPA requirements\n\n"
+            result += "⚠️ **ANONYMIZATION DISABLED** - Tool output may include student identifiers\n\n"
+            result += "🚨 **PRIVACY RISK**: Real student names and data may be sent to the AI client\n"
+            result += "⚖️ **COMPLIANCE**: Review your institution's FERPA and data-handling requirements\n\n"
             result += "💡 **Recommendation**: Enable anonymization in your .env file:\n"
             result += "   ENABLE_DATA_ANONYMIZATION=true\n"
 
         return result
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def list_groups(course_identifier: str | int) -> str:
         """List all groups and their members for a specific course.
@@ -79,11 +80,13 @@ def register_admin_tools(mcp: FastMCP):
 
         for group in groups:
             group_id = group.get("id")
-            group_name = group.get("name", "Unnamed group")
+            group_name = group.get("name") or "Unnamed group"
             group_category = group.get("group_category_id", "Uncategorized")
             member_count = group.get("members_count", 0)
 
-            output += f"Group: {group_name}\n"
+            # Group names (self-signup) and member names/emails are
+            # author-controlled (issue 239).
+            output += f"Group: {fence_untrusted_inline(group_name, 'group name')}\n"
             output += f"ID: {group_id}\n"
             output += f"Category ID: {group_category}\n"
             output += f"Member Count: {member_count}\n"
@@ -98,27 +101,25 @@ def register_admin_tools(mcp: FastMCP):
             elif not members:
                 output += "No members in this group.\n"
             else:
-                # Anonymize member data to protect student privacy
-                try:
-                    members = anonymize_response_data(members, data_type="users")
-                except Exception as e:
-                    log_warning(
-                        "Failed to anonymize group member data; continuing with original data",
-                        error_type=type(e).__name__,
-                    )
-                    # Continue with original data for functionality
+                # Anonymization happens at the client layer (core/client.py) per
+                # ENABLE_DATA_ANONYMIZATION (#179)
                 output += "Members:\n"
                 for member in members:
                     member_id = member.get("id")
-                    member_name = member.get("name", "Unnamed user")
-                    member_email = member.get("email", "No email")
-                    output += f"  - {member_name} (ID: {member_id}, Email: {member_email})\n"
+                    # `or fallback` (not the get default) — Canvas sends an
+                    # explicit null email for accounts with no visible address.
+                    member_name = member.get("name") or "Unnamed user"
+                    member_email = member.get("email") or "No email"
+                    output += (
+                        f"  - {fence_untrusted_inline(member_name, 'user name')} "
+                        f"(ID: {member_id}, Email: {fence_untrusted_inline(member_email, 'user email')})\n"
+                    )
 
             output += "\n"
 
         return output
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def list_users(course_identifier: str) -> str:
         """List users enrolled in a specific course.
@@ -141,35 +142,31 @@ def register_admin_tools(mcp: FastMCP):
         if not users:
             return f"No users found for course {course_identifier}."
 
-        # Anonymize user data to protect student privacy
-        try:
-            users = anonymize_response_data(users, data_type="users")
-        except Exception as e:
-            log_warning(
-                "Failed to anonymize user data; continuing with original data",
-                error_type=type(e).__name__,
-            )
-            # Continue with original data for functionality
-
         users_info = []
         for user in users:
             user_id = user.get("id")
-            name = user.get("name", "Unknown")
-            email = user.get("email", "No email")
+            # `or fallback` — Canvas sends an explicit null email for accounts
+            # with no visible address; the get default only covers a missing key.
+            name = user.get("name") or "Unknown"
+            email = user.get("email") or "No email"
 
             # Get enrollment info
             enrollments = user.get("enrollments", [])
             roles = [enrollment.get("role", "Student") for enrollment in enrollments]
             role_list = ", ".join(set(roles)) if roles else "Student"
 
+            # Display names and emails are author-controlled (issue 239).
             users_info.append(
-                f"ID: {user_id}\nName: {name}\nEmail: {email}\nRoles: {role_list}\n"
+                f"ID: {user_id}\n"
+                f"Name: {fence_untrusted_inline(name, 'user name')}\n"
+                f"Email: {fence_untrusted_inline(email, 'user email')}\n"
+                f"Roles: {role_list}\n"
             )
 
         course_display = await get_course_code(course_id) or course_identifier
         return f"Users in Course {course_display}:\n\n" + "\n".join(users_info)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_student_analytics(course_identifier: str,
                                   include_participation: bool = True,
@@ -211,14 +208,6 @@ def register_admin_tools(mcp: FastMCP):
         )
         if isinstance(students, dict) and "error" in students:
             students = []
-
-        try:
-            students = anonymize_response_data(students, data_type="users")
-        except Exception as e:
-            log_warning(
-                "Failed to anonymize student analytics data; continuing with original data",
-                error_type=type(e).__name__,
-            )
 
         by_id = {u.get("id"): u for u in students}
 
@@ -286,7 +275,12 @@ def register_admin_tools(mcp: FastMCP):
         lines.append("-" * 100)
 
         for r in rows:
-            parts = [r["name"][:30].ljust(30), str(r["engagement_score"]).rjust(3)]
+            # Student names are author-controlled (issue 239). Truncate the RAW
+            # name first, THEN fence — slicing a fenced string would split the
+            # marker. The fence makes the name column variable-width, so the
+            # fixed-column alignment no longer applies to it.
+            safe_name = fence_untrusted_inline(str(r["name"])[:30], "student name")
+            parts = [safe_name, str(r["engagement_score"]).rjust(3)]
             if include_access_stats:
                 parts += [str(r["page_views"]).rjust(5), f"{r['page_views_pct_of_max']}%".rjust(4)]
             if include_participation:
@@ -302,7 +296,7 @@ def register_admin_tools(mcp: FastMCP):
 
         return "\n".join(lines)
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=True))
     @validate_params
     async def create_student_anonymization_map(course_identifier: str | int) -> str:
         """Create a local CSV file mapping real student data to anonymous IDs for a course.
@@ -315,6 +309,12 @@ def register_admin_tools(mcp: FastMCP):
 
         from ..core.anonymization import generate_anonymous_id
 
+        if is_http_request_active():
+            return (
+                "Error: Creating a local identity map is only available on a local "
+                "(stdio) server. No file was written."
+            )
+
         course_id = await get_course_id(course_identifier)
 
         # Get all students in the course
@@ -324,8 +324,13 @@ def register_admin_tools(mcp: FastMCP):
             "per_page": 100
         }
 
+        # skip_anonymization: this tool's entire job is to record which real
+        # student each pseudonym stands for. Fetching the roster THROUGH the
+        # anonymizer maps pseudonyms to pseudonyms, so the CSV it wrote was
+        # useless (issue #179). The file is written locally, for the
+        # instructor who already has roster access.
         students = await fetch_all_paginated_results(
-            f"/courses/{course_id}/users", params
+            f"/courses/{course_id}/users", params, skip_anonymization=True
         )
 
         if isinstance(students, dict) and "error" in students:
@@ -356,10 +361,13 @@ def register_admin_tools(mcp: FastMCP):
             # Generate the same anonymous ID that would be used by the anonymization system
             anonymous_id = generate_anonymous_id(real_id, prefix="Student")
 
+            # Names and emails are user-controlled on many Canvas instances, and
+            # this file exists to be opened in a spreadsheet, so neutralize any
+            # leading formula marker before it becomes an executable cell.
             mapping_data.append({
-                "real_name": real_name,
+                "real_name": csv_safe_cell(real_name),
                 "real_id": real_id,
-                "real_email": real_email,
+                "real_email": csv_safe_cell(real_email),
                 "anonymous_id": anonymous_id
             })
 

@@ -4,19 +4,40 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ..core.cache import get_course_id
+from ..core.credentials import is_http_request_active
 from ..core.file_validation import sanitize_filename
 from ..core.peer_reviews import PeerReviewAnalyzer
+from ..core.untrusted_content import fence_untrusted, fence_untrusted_fields
 from ..core.validation import validate_params
 
+# Student display names in the analyzer JSON are author-controlled (issue 239).
+_PEER_REVIEW_NAME_FIELDS = {
+    "student_name": "student name",
+    "reviewer_name": "student name",
+    "reviewee_name": "student name",
+}
 
-def register_peer_review_tools(mcp: FastMCP):
+
+def _fence_peer_review_names(result: object) -> None:
+    """Fence student names in a peer-review analyzer result, plus the
+    assignment name under assignment_info (a bare ``name`` key is fenced
+    only there, to avoid over-matching unrelated ``name`` keys)."""
+    fence_untrusted_fields(result, _PEER_REVIEW_NAME_FIELDS)
+    if isinstance(result, dict):
+        info = result.get("assignment_info")
+        if isinstance(info, dict) and isinstance(info.get("name"), str) and info["name"]:
+            from ..core.untrusted_content import fence_untrusted_inline
+            info["name"] = fence_untrusted_inline(info["name"], "assignment name")
+
+
+def register_peer_review_tools(mcp: FastMCP) -> None:
     """Register all peer review analytics MCP tools."""
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_peer_review_assignments(
         course_identifier: str | int,
@@ -46,12 +67,13 @@ def register_peer_review_tools(mcp: FastMCP):
             if "error" in result:
                 return f"Error getting peer review assignments: {result['error']}"
 
+            _fence_peer_review_names(result)
             return json.dumps(result, indent=2)
 
         except Exception as e:
             return f"Error in get_peer_review_assignments: {str(e)}"
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_peer_review_completion_analytics(
         course_identifier: str | int,
@@ -81,12 +103,13 @@ def register_peer_review_tools(mcp: FastMCP):
             if "error" in result:
                 return f"Error getting peer review completion analytics: {result['error']}"
 
+            _fence_peer_review_names(result)
             return json.dumps(result, indent=2)
 
         except Exception as e:
             return f"Error in get_peer_review_completion_analytics: {str(e)}"
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=False))
     @validate_params
     async def generate_peer_review_report(
         course_identifier: str | int,
@@ -97,7 +120,7 @@ def register_peer_review_tools(mcp: FastMCP):
         include_action_items: bool = True,
         include_timeline_analysis: bool = True,
         save_to_file: bool = False,
-        filename: str = None
+        filename: str | None = None
     ) -> str:
         """Generate peer review completion report with summary, analytics, and follow-up recommendations.
 
@@ -112,6 +135,11 @@ def register_peer_review_tools(mcp: FastMCP):
             save_to_file: Save report to local file
             filename: Custom filename for saved report
         """
+        if save_to_file and is_http_request_active():
+            return (
+                "Error: Saving reports to the server filesystem is only available "
+                "on a local (stdio) server. Set save_to_file=false to return the report."
+            )
         try:
             course_id = await get_course_id(course_identifier)
             analyzer = PeerReviewAnalyzer()
@@ -152,15 +180,28 @@ def register_peer_review_tools(mcp: FastMCP):
                     except Exception as save_error:
                         result["save_error"] = f"Failed to save file: {str(save_error)}"
 
-            if report_format in ["csv", "markdown"]:
-                return result.get("report", json.dumps(result, indent=2))
+            if report_format == "markdown":
+                # The markdown report embeds Canvas-authored student names as a
+                # pre-built string, so individual fields can't be fenced after
+                # the fact. Wrap the whole MODEL-FACING copy in one provenance
+                # fence (the raw on-disk file written above is untouched).
+                report_md: str = result.get("report", json.dumps(result, indent=2))
+                return fence_untrusted(report_md, "peer review report (contains student names)")
+            if report_format == "csv":
+                # The CSV embeds raw student names + comments; csv_safe_cell
+                # stops spreadsheet formulas, not prompt injection. The saved
+                # file above is raw (a data artifact); the MODEL-FACING return
+                # is wrapped in one provenance fence (issue 239).
+                report_csv: str = result.get("report", json.dumps(result, indent=2))
+                return fence_untrusted(report_csv, "peer review report CSV (contains student names)")
             else:
+                _fence_peer_review_names(result)
                 return json.dumps(result, indent=2)
 
         except Exception as e:
             return f"Error in generate_peer_review_report: {str(e)}"
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def get_peer_review_followup_list(
         course_identifier: str | int,
@@ -198,6 +239,7 @@ def register_peer_review_tools(mcp: FastMCP):
             if "error" in result:
                 return f"Error getting peer review followup list: {result['error']}"
 
+            _fence_peer_review_names(result)
             return json.dumps(result, indent=2)
 
         except Exception as e:

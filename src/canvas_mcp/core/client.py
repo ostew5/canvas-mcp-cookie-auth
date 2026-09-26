@@ -1,17 +1,20 @@
 """HTTP client and Canvas API utilities."""
 
 import asyncio
+import re
 import weakref
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from copy import deepcopy
+from typing import Any, Final, Literal, cast
 from urllib.parse import urlencode
 
 import httpx
 
-from .anonymization import anonymize_response_data
+from .anonymization import anonymize_response_data, scrub_identity
 from .credentials import get_request_credentials, is_http_request_active
 from .logging import log_debug, log_error, log_warning, sanitize_url
+from .write_outcome import NO_WRITE_STATUSES, RequestFailure, WriteOutcome
 
 # Rate limit retry configuration
 MAX_RETRIES = 3
@@ -19,6 +22,10 @@ INITIAL_BACKOFF_SECONDS = 2
 
 # Default number of results per page for paginated requests
 DEFAULT_PAGE_SIZE = 100
+# Fail explicitly rather than looping forever on a broken pagination chain.
+MAX_PAGINATION_PAGES = 10000
+API_ROOT_REST: Final = "rest"
+API_ROOT_QUIZ: Final = "quiz"
 
 
 def _canvas_auth_headers(api_token: str = "", session_cookie: str = "") -> dict[str, str]:
@@ -36,6 +43,26 @@ def _canvas_auth_headers(api_token: str = "", session_cookie: str = "") -> dict[
     elif session_cookie:
         headers["Cookie"] = f"canvas_session={session_cookie}"
     return headers
+
+def _resolve_canvas_api_root(base_api_url: str, api_root: Literal["rest", "quiz"]) -> str:
+    """Resolve a configured ``…/api/v<N>`` base URL to a selected Canvas API root.
+
+    ``rest`` keeps the configured URL unchanged. ``quiz`` rewrites only the
+    trailing API version segment to ``/api/quiz/v1`` while preserving any
+    institution prefix (e.g. ``/lms``). This is an explicit call-site opt-in;
+    endpoint strings never select a base path implicitly.
+    """
+    if api_root == API_ROOT_REST:
+        return base_api_url
+
+    match = re.search(r"/api/v\d+$", base_api_url)
+    if not match:
+        raise ValueError(
+            "Invalid Canvas API base URL for quiz root resolution: expected trailing /api/v<N>"
+        )
+
+    return f"{base_api_url[:match.start()]}/api/quiz/v1"
+
 
 # HTTP client will be initialized with configuration
 http_client: httpx.AsyncClient | None = None
@@ -76,58 +103,231 @@ def _get_request_semaphore() -> asyncio.Semaphore:
     return _request_semaphore
 
 
-def _determine_data_type(endpoint: str) -> str:
-    """Determine the type of data based on the API endpoint."""
-    endpoint_lower = endpoint.lower()
+def _path_segments(endpoint: str) -> list[str]:
+    """Lower-cased, query-stripped path segments of a Canvas API endpoint."""
+    path = endpoint.lower().split('?', 1)[0]
+    return [seg for seg in path.split('/') if seg]
 
-    if '/users' in endpoint_lower:
+
+def _is_route_segment(segments: list[str], index: int) -> bool:
+    """Whether segments[index] is a route keyword rather than a user slug.
+
+    A segment directly after 'pages' is a user-controlled page slug — e.g. a
+    page named "users" at /courses/{id}/pages/users — and must never be treated
+    as a route keyword.
+    """
+    return not (index > 0 and segments[index - 1] == 'pages')
+
+
+def _has_route_segment(segments: list[str], names: set[str]) -> bool:
+    """Whether any route (non-slug) segment matches one of `names`."""
+    return any(
+        seg in names and _is_route_segment(segments, i)
+        for i, seg in enumerate(segments)
+    )
+
+
+def _self_submission_indices(segments: list[str]) -> set[int]:
+    """Indices of 'submissions' route segments followed by the literal 'self'.
+
+    Anchored on the literal 'self' segment IMMEDIATELY after a 'submissions'
+    route segment. A looser match (e.g. 'self' anywhere in the path) would
+    recreate the #164 bypass class, where a broad short-circuit silently
+    disabled anonymization for unrelated student-data endpoints.
+    """
+    return {
+        i
+        for i, seg in enumerate(segments)
+        if seg == 'submissions'
+        and _is_route_segment(segments, i)
+        and i + 1 < len(segments)
+        and segments[i + 1] == 'self'
+    }
+
+
+# Endpoints that describe ONLY the authenticated caller. Anonymizing these
+# corrupts the caller's own identity (they would be told their name is
+# "Student_<hash>"), which is a data-integrity bug, not a privacy win: FERPA
+# protects a student's record FROM OTHERS, never from themselves.
+#
+# This is a deliberate loosening of a FERPA control, so it is an EXACT
+# full-joined-path allowlist, never a prefix or substring rule. A looser form is
+# exactly how #164/#166 happened. Notably NOT exempt (all still anonymized):
+#   users/self/observees   -> other people (the observed students)
+#   users/self/courses/... -> may embed other users
+#   courses/*/enrollments, courses/*/users -> rosters
+#   users/<other-id>/profile -> somebody else
+#   users/self/enrollments -> looks self-only by its path but is NOT. Canvas
+#       expands it with include[]=observed_users, which returns OTHER students'
+#       records on observer enrollments. This gate sees only the path and cannot
+#       see request parameters, so exempting the path would let those bypass
+#       anonymization whenever that include is present. get_my_enrollments
+#       deliberately reads /courses instead, so nothing needs this exemption.
+_SELF_ONLY_ENDPOINTS = frozenset({
+    "users/self",
+    "users/self/profile",
+})
+
+
+def _is_self_only_endpoint(segments: list[str]) -> bool:
+    """Whether the path is EXACTLY one of the caller-only endpoints."""
+    return "/".join(segments) in _SELF_ONLY_ENDPOINTS
+
+
+def _determine_data_type(endpoint: str) -> str:
+    """Determine the type of data based on the API endpoint.
+
+    Segment-aware (query string stripped, page slugs excluded) so that a
+    substring match on a user-controlled slug cannot mis-route a response into
+    the wrong typed handler.
+    """
+    segments = _path_segments(endpoint)
+
+    if _has_route_segment(segments, {'users'}):
         return 'users'
-    elif '/discussion_topics' in endpoint_lower and '/entries' in endpoint_lower:
+    if _has_route_segment(segments, {'discussion_topics', 'discussion_entries'}):
         return 'discussions'
-    elif '/discussion' in endpoint_lower:
-        return 'discussions'
-    elif '/submissions' in endpoint_lower:
+    if _has_route_segment(segments, {'submissions'}):
         return 'submissions'
-    elif '/assignments' in endpoint_lower:
+    if _has_route_segment(segments, {'assignments'}):
         return 'assignments'
-    elif '/enrollments' in endpoint_lower:
+    if _has_route_segment(segments, {'enrollments'}):
         return 'users'  # Enrollments contain user data
-    else:
-        return 'general'
+    return 'general'
+
+
+# --------------------------------------------------------------------------
+# Anonymization tiers (issue #179)
+# --------------------------------------------------------------------------
+# A single boolean could not express the two endpoint families found by the
+# #166 follow-up audit: /conversations needs the free-text half of the scrubber
+# without the name half, /pages needs the name half without the free-text half.
+# Forcing either into the all-or-nothing "full" tier costs real functionality,
+# and leaving them at "none" (the pre-#179 state) leaks PII.
+
+#: Not sensitive — response passes through untouched.
+ANONYMIZE_NONE = "none"
+
+#: Everything: recursive identity scrub + free-text redaction + the typed
+#: refinements (submission-content redaction, long-description truncation).
+ANONYMIZE_FULL = "full"
+
+#: Identity only — names/avatars/direct identifiers scrubbed, free text kept.
+ANONYMIZE_IDENTITY = "identity"
+
+#: Free text only — emails/phones redacted from bodies, direct identifiers and
+#: avatars nulled, but display names preserved.
+ANONYMIZE_FREE_TEXT = "free_text"
+
+
+def _endpoint_anonymization_mode(endpoint: str) -> str:
+    """Which anonymization tier applies to `endpoint`.
+
+    Sensitive-data checks MUST run before any safe-endpoint reasoning: almost
+    every call here is scoped /courses/{id}/..., so a '/courses' short-circuit
+    checked first silently disables anonymization for the whole codebase
+    (issue #164). Anything not matched defaults to ANONYMIZE_NONE.
+
+    The tiers are ordered most-protective-first, so a path that matches several
+    families (e.g. /courses/1/pages plus a /users segment) gets the strongest
+    treatment rather than the narrowest.
+
+    Partially gated (issue #179) — matched, but NOT at the "full" tier:
+    - /conversations, /conversations/{id} -> ANONYMIZE_FREE_TEXT. Previously
+      ungated entirely: a live call returned 97 records with student email
+      addresses inlined in `last_message`/`last_authored_message` plus
+      participant pronouns and avatars. But this is the caller's OWN inbox, so
+      the participants are their own correspondents, not third parties whose
+      records they are browsing — pseudonymising `participants[].name` would
+      make "who emailed me?" unanswerable while protecting nobody.
+    - /pages, /courses/{id}/pages/{slug}, /courses/{id}/front_page ->
+      ANONYMIZE_IDENTITY. Previously ungated: `last_edited_by` leaked a display
+      name and avatar URL. front_page returns the same block but carries no
+      'pages' segment, so it stayed ungated after #179 until a live check found
+      it still returning display_name, pronouns and avatar_image_url. Page
+      *bodies* are deliberately exempt — instructors publish office hours,
+      contact addresses and phone numbers on course pages, and redacting those
+      would break the page's purpose.
+
+    Intentionally NOT matched at all:
+    - /groups listings — carry group names, not student names; generic
+      anonymization would mangle them. Membership goes via /groups/{id}/users,
+      which the '/users' rule covers.
+    - /discussion_topics listings (incl. announcements) — typically
+      instructor-authored; student content lives under the content endpoints
+      matched below.
+    - /submissions/self — the caller's OWN submission. Anonymizing it redacts
+      body/url/attachments, so a student cannot read back what they submitted
+      (issue #166). Only the literal 'self' sub-route is excluded; any other
+      sensitive segment in the same path still forces anonymization.
+    - the exact self-only paths in _SELF_ONLY_ENDPOINTS — the caller's OWN
+      identity (issue #171). Exact full-path match only.
+    """
+    segments = _path_segments(endpoint)
+
+    # Caller-only identity endpoints: exact-path allowlist, checked before the
+    # sensitive-segment rules because 'users' would otherwise match.
+    if _is_self_only_endpoint(segments):
+        return ANONYMIZE_NONE
+
+    # Drop only the 'submissions' segment of a /submissions/self route; every
+    # other sensitive segment keeps its effect.
+    self_indices = _self_submission_indices(segments)
+    if self_indices:
+        segments = [seg for i, seg in enumerate(segments) if i not in self_indices]
+
+    # Discussion content endpoints carry student posts and names
+    if 'discussion_topics' in segments and _has_route_segment(
+        segments, {'entries', 'view', 'entry_list', 'replies'}
+    ):
+        return ANONYMIZE_FULL
+
+    # Endpoints whose responses contain student records
+    if _has_route_segment(segments, {'users', 'submissions', 'enrollments', 'analytics'}):
+        return ANONYMIZE_FULL
+
+    if _has_route_segment(segments, {'conversations'}):
+        return ANONYMIZE_FREE_TEXT
+
+    # 'front_page' is a page too and returns the same last_edited_by block, but
+    # its path carries no 'pages' segment, so it slipped the slug rule and stayed
+    # ungated after #179. Unlike a page slug, 'front_page' is a fixed Canvas
+    # route word and cannot be user-controlled, so matching it needs no
+    # escalation guard.
+    if _has_route_segment(segments, {'pages'}) or 'front_page' in segments:
+        return ANONYMIZE_IDENTITY
+
+    return ANONYMIZE_NONE
 
 
 def _should_anonymize_endpoint(endpoint: str) -> bool:
-    """Determine if an endpoint should have its data anonymized."""
-    # Don't anonymize these endpoints as they don't contain student data
-    safe_endpoints = [
-        '/courses',  # Course info without student data (unless it includes users)
-        '/self',     # User's own profile
-        '/accounts', # Account information
-        '/terms',    # Academic terms
-    ]
+    """Whether `endpoint` gets any anonymization at all.
 
-    endpoint_lower = endpoint.lower()
+    Thin boolean view over :func:`_endpoint_anonymization_mode`. Callers that
+    need to know *which* treatment applies must use the mode function; this one
+    only answers "is this endpoint gated".
+    """
+    return _endpoint_anonymization_mode(endpoint) != ANONYMIZE_NONE
 
-    # Always anonymize discussion entries as they contain student posts
-    if '/discussion_topics' in endpoint_lower and '/entries' in endpoint_lower:
-        return True
 
-    # Check if it's a safe endpoint
-    for safe in safe_endpoints:
-        if safe in endpoint_lower and '/users' not in endpoint_lower:
-            return False
+def _anonymize_for_endpoint(result: Any, endpoint: str) -> tuple[Any, str]:
+    """Apply `endpoint`'s anonymization tier to a Canvas response.
 
-    # Anonymize endpoints that contain student data
-    student_data_endpoints = [
-        '/users',
-        '/discussion',
-        '/submissions',
-        '/enrollments',
-        '/groups',
-        '/analytics'
-    ]
+    Returns the (possibly rewritten) payload plus a short label for debug
+    logging. The identity/free_text tiers deliberately skip the typed
+    refinements in ``_apply_type_refinements``: those exist for submission and
+    assignment records, which neither /conversations nor /pages returns.
+    """
+    mode = _endpoint_anonymization_mode(endpoint)
 
-    return any(student_endpoint in endpoint_lower for student_endpoint in student_data_endpoints)
+    if mode == ANONYMIZE_FULL:
+        data_type = _determine_data_type(endpoint)
+        return anonymize_response_data(result, data_type), data_type
+    if mode == ANONYMIZE_IDENTITY:
+        return scrub_identity(result, scrub_text=False), mode
+    if mode == ANONYMIZE_FREE_TEXT:
+        return scrub_identity(result, scrub_display_names=False), mode
+    return result, mode
 
 
 def _get_http_client() -> httpx.AsyncClient:
@@ -170,10 +370,12 @@ def _get_http_client() -> httpx.AsyncClient:
 
 async def cleanup_http_client() -> None:
     """Close the HTTP client and release resources."""
-    global http_client
-    if http_client is not None:
-        await http_client.aclose()
-        http_client = None
+    global http_client, _http_client_loop_ref
+    client = http_client
+    http_client = None
+    _http_client_loop_ref = None
+    if client is not None:
+        await client.aclose()
 
 
 @asynccontextmanager
@@ -209,9 +411,12 @@ async def make_canvas_request(
     method: str,
     endpoint: str,
     params: dict[str, Any] | None = None,
-    data: dict[str, Any] | None = None,
+    data: dict[str, Any] | list[tuple[str, Any]] | None = None,
     use_form_data: bool = False,
-    skip_anonymization: bool = False
+    skip_anonymization: bool = False,
+    files: dict[str, tuple[str, bytes, str]] | None = None,
+    api_root: Literal["rest", "quiz"] = API_ROOT_REST,
+    _pagination: dict[str, str | None] | None = None,
 ) -> Any:
     """Make a request to the Canvas API with proper error handling.
 
@@ -224,6 +429,8 @@ async def make_canvas_request(
         data: Request body data
         use_form_data: Use form data instead of JSON
         skip_anonymization: Skip anonymization (used by paginated fetchers)
+        files: Dictionary of file objects for multipart form uploads
+        api_root: Which Canvas API root to call ("rest" => /api/v<N>, "quiz" => /api/quiz/v1)
     """
 
     from .audit import log_data_access
@@ -238,13 +445,42 @@ async def make_canvas_request(
     if not endpoint.startswith('/'):
         endpoint = f"/{endpoint}"
 
+    # Endpoints are built by f-string interpolation of caller-supplied identifiers
+    # (".../assignments/{assignment_id}/submissions/self"). A '?' or '#' inside an
+    # identifier ends the path early and demotes everything after it to the query
+    # or fragment, so a value like "123/submissions/456?" silently retargets a
+    # hard-coded self-scoped route at another user's record. Every caller passes
+    # query parameters via `params=`, so a delimiter in the path is always
+    # smuggling, never a legitimate call.
+    bad_delimiter = next((c for c in ("?", "#") if c in endpoint), None)
+    if bad_delimiter is not None:
+        log_warning(
+            "Blocked Canvas API request with a delimiter in the endpoint path",
+            endpoint=sanitize_url(endpoint),
+        )
+        return RequestFailure(f"Invalid endpoint: '{bad_delimiter}' is not allowed in a request path", WriteOutcome.NOT_DISPATCHED)
+    if any(seg == ".." for seg in endpoint.split("/")):
+        log_warning(
+            "Blocked Canvas API request with a traversal segment in the endpoint path",
+            endpoint=sanitize_url(endpoint),
+        )
+        return RequestFailure("Invalid endpoint: '..' is not allowed in a request path", WriteOutcome.NOT_DISPATCHED)
+
+    if api_root not in (API_ROOT_REST, API_ROOT_QUIZ):
+        return {"error": f"Unsupported api_root: {api_root}"}
+
     if req_creds:
         # Per-request client with user's credentials (HTTP mode)
         client = httpx.AsyncClient(
             headers=_canvas_auth_headers(req_creds.api_token, req_creds.session_cookie),
             timeout=config.api_timeout,
         )
-        url = f"{req_creds.api_url.rstrip('/')}{endpoint}"
+        try:
+            base_url = _resolve_canvas_api_root(req_creds.api_url.rstrip('/'), api_root)
+        except ValueError as exc:
+            await client.aclose()
+            return {"error": str(exc)}
+        url = f"{base_url}{endpoint}"
         _close_client = True
     elif is_http_request_active():
         # HTTP request without a per-request token: fail closed. Never fall
@@ -255,18 +491,37 @@ async def make_canvas_request(
         )
         return {"error": "Canvas token required for HTTP request"}
     else:
-        # Global client (stdio mode)
-        client = _get_http_client()
-        url = f"{config.canvas_api_url.rstrip('/')}{endpoint}"
+        # Shared client is selected immediately before dispatch (stdio mode).
+        try:
+            base_url = _resolve_canvas_api_root(config.canvas_api_url.rstrip('/'), api_root)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        url = f"{base_url}{endpoint}"
         _close_client = False
 
-    # Gate outbound calls with concurrency semaphore (uses MAX_CONCURRENT_REQUESTS)
-    semaphore = _get_request_semaphore()
-    async with semaphore:
-        # Retry loop for rate limiting
-        try:
+    # Own the client before awaiting the semaphore: cancellation while queued
+    # must close request-local clients too.
+    try:
+        if _pagination is not None and _pagination.get("url"):
+            # Canvas next links are opaque. Preserve their exact query while
+            # refusing to forward credentials to another origin or endpoint.
+            try:
+                target = httpx.URL(cast(str, _pagination["url"]))
+            except httpx.InvalidURL:
+                return {"error": "Invalid pagination link"}
+            expected = httpx.URL(url)
+            if target.copy_with(query=None) != expected.copy_with(query=None):
+                return {"error": "Invalid pagination link: origin or endpoint changed"}
+            url = str(target)
+            params = None
+        semaphore = _get_request_semaphore()
+        async with semaphore:
             for attempt in range(MAX_RETRIES + 1):
                 try:
+                    # A semaphore wait or 429 backoff may span a cleanup.
+                    # Select the shared client at dispatch, not before waiting.
+                    if not _close_client:
+                        client = _get_http_client()
                     # Log the request for debugging (if enabled)
                     if config.log_api_requests:
                         retry_info = f" (retry {attempt}/{MAX_RETRIES})" if attempt > 0 else ""
@@ -275,7 +530,15 @@ async def make_canvas_request(
                     if method.lower() == "get":
                         response = await client.get(url, params=params)
                     elif method.lower() == "post":
-                        if use_form_data:
+                        if files:
+                            # File uploads always pass dict form fields, never
+                            # the list-of-tuples encoding.
+                            response = await client.post(
+                                url,
+                                data=cast("dict[str, Any] | None", data),
+                                files=files,
+                            )
+                        elif use_form_data:
                             # Handle list of tuples separately to work around httpx async bug
                             # with duplicate keys (e.g., module[prerequisite_module_ids][])
                             if isinstance(data, list):
@@ -310,16 +573,18 @@ async def make_canvas_request(
 
                     response.raise_for_status()
                     result = response.json()
+                    if _pagination is not None:
+                        _pagination["current"] = str(response.request.url)
+                        _pagination["next"] = response.links.get("next", {}).get("url")
 
                     # Apply anonymization if enabled and this endpoint contains student data
                     # Skip if explicitly requested (e.g., from paginated fetcher that will anonymize the full result)
-                    if not skip_anonymization and config.enable_data_anonymization and _should_anonymize_endpoint(endpoint):
-                        data_type = _determine_data_type(endpoint)
-                        result = anonymize_response_data(result, data_type)
+                    if not skip_anonymization and config.enable_data_anonymization:
+                        result, applied = _anonymize_for_endpoint(result, endpoint)
 
                         # Log anonymization for debugging (if enabled)
-                        if config.anonymization_debug:
-                            log_debug(f"Applied {data_type} anonymization to {endpoint}")
+                        if config.anonymization_debug and applied != ANONYMIZE_NONE:
+                            log_debug(f"Applied {applied} anonymization to {endpoint}")
 
                     # Audit: log successful data access
                     log_data_access(method, endpoint, "success")
@@ -357,7 +622,9 @@ async def make_canvas_request(
                     # Audit: log HTTP error (status code only — response body may contain PII)
                     log_data_access(method, endpoint, "error", f"HTTP {e.response.status_code}")
 
-                    return {"error": error_message}
+                    outcome = (WriteOutcome.REJECTED if e.response.status_code in NO_WRITE_STATUSES
+                               else WriteOutcome.MAY_HAVE_WRITTEN)
+                    return RequestFailure(error_message, outcome)
 
                 except Exception as e:
                     log_error(f"Request failed for {sanitize_url(endpoint)}", error_type=type(e).__name__)
@@ -365,13 +632,13 @@ async def make_canvas_request(
                     # Audit: log request exception (type only — message may contain PII)
                     log_data_access(method, endpoint, "error", type(e).__name__)
 
-                    return {"error": f"Request failed: {str(e)}"}
+                    return RequestFailure(f"Request failed: {str(e)}", WriteOutcome.MAY_HAVE_WRITTEN)
 
             # Should never reach here, but just in case
             return {"error": "Max retries exceeded"}
-        finally:
-            if _close_client:
-                await client.aclose()
+    finally:
+        if _close_client:
+            await client.aclose()
 
 
 async def upload_file_to_storage(
@@ -420,7 +687,7 @@ async def upload_file_to_storage(
 
             # Log for debugging
             if config.log_api_requests:
-                log_debug(f"Uploading file to storage: {upload_url}", filename=filename, content_type=content_type, size=len(file_content))
+                log_debug(f"Uploading file to storage: {sanitize_url(upload_url)}", filename=filename, content_type=content_type, size=len(file_content))
 
             # Make the upload request
             # Note: follow_redirects=False because Canvas may return a 3xx with file info
@@ -437,7 +704,8 @@ async def upload_file_to_storage(
             if response.status_code in (200, 201):
                 # Direct success response
                 try:
-                    return response.json()
+                    body: dict[str, Any] = response.json()
+                    return body
                 except ValueError:
                     # Some storage backends return empty success
                     return {"success": True, "status_code": response.status_code}
@@ -454,7 +722,8 @@ async def upload_file_to_storage(
                         async with canvas_authenticated_client() as canvas_client:
                             confirm_response = await canvas_client.get(redirect_url)
                             confirm_response.raise_for_status()
-                            return confirm_response.json()
+                            confirmed: dict[str, Any] = confirm_response.json()
+                            return confirmed
                     except PermissionError as e:
                         return {"error": str(e)}
                 else:
@@ -478,51 +747,75 @@ async def upload_file_to_storage(
             return {"error": f"Upload failed: {str(e)}"}
 
 
-async def fetch_all_paginated_results(endpoint: str, params: dict[str, Any] | None = None) -> Any:
+async def fetch_all_paginated_results(
+    endpoint: str,
+    params: dict[str, Any] | None = None,
+    skip_anonymization: bool = False,
+    api_root: Literal["rest", "quiz"] = API_ROOT_REST,
+) -> Any:
     """Fetch all results from a paginated Canvas API endpoint.
 
     Handles pagination automatically and applies anonymization once to the complete dataset
     to ensure consistent anonymization across all pages.
+
+    Args:
+        endpoint: Canvas API endpoint.
+        params: Query parameters.
+        skip_anonymization: Return the raw records. Reserved for the one caller
+            whose whole purpose is to see real identities — the local
+            pseudonym-map export. Anonymizing that fetch maps pseudonyms to
+            pseudonyms, which is not a privacy win, just a broken tool.
+        api_root: Which Canvas API root to call ("rest" => /api/v<N>,
+            "quiz" => /api/quiz/v1). Only the base URL changes; the
+            anonymization gate keys off ``endpoint``, so an alternate root
+            cannot route around it. Paginated quiz-root callers must use this
+            rather than looping over ``make_canvas_request`` themselves, or they
+            lose the single-anonymization-pass-over-the-complete-dataset
+            property this function exists to provide.
     """
-    if params is None:
-        params = {}
-
-    # Ensure we get a reasonable number per page
-    if "per_page" not in params:
-        params["per_page"] = 100
-
+    # Each caller owns its query and cursor, even if callers share input params.
+    current_params = deepcopy(params) if params is not None else {}
+    current_params.setdefault("per_page", DEFAULT_PAGE_SIZE)
+    current_params["page"] = 1
+    pagination: dict[str, str | None] = {}
+    seen: set[str] = set()
     all_results: list[Any] = []
-    page = 1
 
-    while True:
-        current_params = {**params, "page": page}
-        # Skip anonymization on individual pages - we'll anonymize the complete dataset
-        response = await make_canvas_request("get", endpoint, params=current_params, skip_anonymization=True)
-
+    for _ in range(MAX_PAGINATION_PAGES):
+        response = await make_canvas_request(
+            "get", endpoint, params=current_params, skip_anonymization=True,
+            api_root=api_root, _pagination=pagination,
+        )
         if isinstance(response, dict) and "error" in response:
-            log_error(f"Error fetching page {page}", error=response['error'])
             return response
-
-        if not response or not isinstance(response, list) or len(response) == 0:
-            break
-
+        if not isinstance(response, list):
+            return {"error": "Invalid paginated response: expected a list"}
         all_results.extend(response)
-
-        # If we got fewer results than requested per page, we're done
-        if len(response) < params.get("per_page", 100):
+        current = pagination.get("current")
+        if current is not None:
+            seen.add(str(httpx.URL(current)))
+        next_url = pagination.get("next")
+        if not next_url:
             break
-
-        page += 1
+        try:
+            next_identity = str(httpx.URL(next_url))
+        except httpx.InvalidURL:
+            return {"error": "Invalid pagination link"}
+        if next_identity in seen:
+            return {"error": "Pagination cycle detected; no partial result returned"}
+        pagination["url"] = next_url
+        current_params = {}  # The opaque next URL contains the complete query.
+    else:
+        return {"error": f"Pagination exceeded {MAX_PAGINATION_PAGES} pages; no partial result returned"}
 
     # Apply anonymization to the complete result set if needed
     from .config import get_config
     config = get_config()
 
-    if config.enable_data_anonymization and _should_anonymize_endpoint(endpoint):
-        data_type = _determine_data_type(endpoint)
-        all_results = anonymize_response_data(all_results, data_type)
+    if not skip_anonymization and config.enable_data_anonymization:
+        all_results, applied = _anonymize_for_endpoint(all_results, endpoint)
 
-        if config.anonymization_debug:
-            log_debug(f"Applied {data_type} anonymization to paginated results from {endpoint}")
+        if config.anonymization_debug and applied != ANONYMIZE_NONE:
+            log_debug(f"Applied {applied} anonymization to paginated results from {endpoint}")
 
     return all_results

@@ -1,6 +1,7 @@
 """Structured audit logging for Canvas MCP Server.
 
-Provides FERPA-compliant audit trail for data access and code execution events.
+Provides a structured audit trail that can support institutional privacy and
+compliance processes for data access and code execution events.
 Events are emitted as JSON lines to both stderr and a rotating log file.
 
 Controlled by:
@@ -13,7 +14,7 @@ import json
 import logging
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -103,7 +104,7 @@ def init_audit_logging() -> None:
 
 def _emit(event: dict[str, Any]) -> None:
     """Emit a structured JSON audit event."""
-    event["timestamp"] = datetime.now(timezone.utc).isoformat()
+    event["timestamp"] = datetime.now(UTC).isoformat()
     _audit_logger.info(json.dumps(event, default=str))
 
 
@@ -166,6 +167,34 @@ def log_code_execution(
     if error:
         event["error"] = error
 
+    _emit(event)
+
+
+def log_access_change(
+    action: str,
+    oid: str,
+    *,
+    upn: str | None = None,
+    source: str = "self-service",
+) -> None:
+    """Audit an authorization-allowlist change (grant/revoke/deny).
+
+    Args:
+        action: "grant", "revoke", or "deny".
+        oid: The affected Entra object ID.
+        upn: Optional user principal name (recorded in the audit log only).
+        source: How the change was made (default the self-service email flow).
+    """
+    if not _access_events_enabled:
+        return
+    event: dict[str, Any] = {
+        "event_type": "access_change",
+        "action": action,
+        "entra_oid": oid,
+    }
+    if upn:
+        event["upn"] = upn
+    event["source"] = source
     _emit(event)
 
 

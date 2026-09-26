@@ -12,7 +12,7 @@ Grade Canvas LMS assignments efficiently using rubric-based workflows. This skil
 - Canvas MCP server running and connected
 - Authenticated with an **educator** (instructor/TA) Canvas API token
 - Assignment must exist and have submissions to grade
-- Rubric must already be created in Canvas and associated with the assignment (Canvas API cannot reliably create rubrics -- use the Canvas web UI for that)
+- Rubric must be created and associated with the assignment with `use_for_grading=true`. Use `create_rubric` for creation and `associate_rubric` for an existing rubric; use `update_rubric` (two-call preview + token) for text/point edits; add or remove criteria in the Canvas UI.
 
 ## Workflow
 
@@ -24,12 +24,12 @@ Before grading, retrieve the assignment details and its rubric criteria.
 get_assignment_details(course_identifier, assignment_id)
 ```
 
-Then get the rubric. Use `get_assignment_rubric_details` if the rubric is already linked to the assignment, or `list_all_rubrics` to browse all rubrics in the course:
+Then get the rubric. Use `get_rubric` if the rubric is already linked to the assignment, or `list_rubrics` to browse all rubrics in the course:
 
 ```
-get_assignment_rubric_details(course_identifier, assignment_id)
-list_all_rubrics(course_identifier)
-get_rubric_details(course_identifier, rubric_id)
+get_rubric(course_identifier, assignment_id=assignment_id)
+list_rubrics(course_identifier)
+get_rubric(course_identifier, rubric_id=rubric_id)
 ```
 
 Record the **criterion IDs** (often prefixed with underscore, e.g., `_8027`) and **rating IDs** from the rubric response. These are required for rubric-based grading.
@@ -57,12 +57,12 @@ How many submissions need grading?
 +-- 10-29 submissions
 |   Use bulk_grade_submissions (concurrent batch processing)
 |   Set max_concurrent: 5, rate_limit_delay: 1.0
-|   ALWAYS run with dry_run: true first
+|   Run with dry_run: true first (Safety Rule 1)
 |
 +-- 30+ submissions OR custom grading logic needed
     Use execute_typescript with bulkGrade function
-    99.7% token savings -- grading logic runs locally
-    ALWAYS run with dry_run: true first
+    Grading logic runs locally; only selected output returns to the model
+    Pass dryRun: true on the first run
 ```
 
 ### Strategy A: Single Grading (1-9 submissions)
@@ -124,6 +124,7 @@ execute_typescript(code: `
   await bulkGrade({
     courseIdentifier: "COURSE_ID",
     assignmentId: "ASSIGNMENT_ID",
+    dryRun: true,  // preview first; re-run with false after review
     gradingFunction: (submission) => {
       // Custom grading logic runs locally -- no token cost
       const notebook = submission.attachments?.find(
@@ -134,8 +135,9 @@ execute_typescript(code: `
 
       return {
         points: 100,
-        rubricAssessment: { "_8027": { points: 100 } },
-        comment: "Graded via automated review"
+        rubricAssessment: { "_8027": { points: 100 } }
+        // No `comment` here on purpose -- see Safety Rule 6. Add one only when
+        // the instructor asked for written feedback, and make it feedback.
       };
     }
   });
@@ -152,9 +154,9 @@ The three strategies have very different token costs:
 |----------|------|------------|-----|
 | `grade_with_rubric` | 1-9 submissions | Low | Few round-trips, small payloads |
 | `bulk_grade_submissions` | 10-29 submissions | Medium | One call with batch data |
-| `execute_typescript` | 30+ submissions | Minimal | Grading logic runs locally; only the code string is sent. **99.7% savings** vs loading all submissions into context |
+| `execute_typescript` | 30+ submissions | Workload-dependent | Grading logic runs locally; only the code and selected output need to enter model context |
 
-The key insight: as submission count grows, sending grading logic to the server (code execution) is far cheaper than bringing all submission data into the conversation.
+The key insight: as submission count grows, sending grading logic to the server can use less model context than bringing all submission data into the conversation.
 
 ## Safety Rules
 
@@ -163,6 +165,7 @@ The key insight: as submission count grows, sending grading logic to the server 
 3. **Spot-check before bulk.** For Strategy B and C, grade 1-2 submissions manually with `grade_with_rubric` first. Verify in Canvas that the grade and rubric feedback appear correctly.
 4. **Respect rate limits.** Use `max_concurrent: 5` and `rate_limit_delay: 1.0` (1 second between batches). Canvas rate limits are approximately 700 requests per 10 minutes.
 5. **Do not grade without explicit instructor confirmation.** Always present the grading plan (rubric mapping, point values, number of students affected) and wait for approval before submitting grades.
+6. **Never attach a comment the instructor did not ask for.** A submission comment is visible to the student in SpeedGrader, it *appends* on every call rather than replacing, and it cannot be un-sent. "Assign grade 8" means the grade only. Never generate a comment that restates the grade or narrates that grading happened (e.g. "Graded via automated review") — that reads to the student as a bot mark on their work and carries no feedback. Include a comment only when the instructor asked for written feedback, and then make it feedback about the work.
 
 ## Example Prompts
 
@@ -179,6 +182,6 @@ The key insight: as submission count grows, sending grading logic to the server 
 |-------|-------|--------|
 | 401 Unauthorized | Token expired or invalid | Regenerate Canvas API token |
 | 403 Forbidden | Not an instructor/TA for this course | Verify Canvas role |
-| 404 Not Found | Wrong course, assignment, or rubric ID | Re-check IDs with `list_assignments` or `list_all_rubrics` |
+| 404 Not Found | Wrong course, assignment, or rubric ID | Re-check IDs with `list_assignments` or `list_rubrics` |
 | 422 Unprocessable | Invalid rubric assessment format | Verify criterion IDs and point ranges match the rubric |
-| Partial failures in bulk | Some grades submitted, others failed | Check the response for per-student status; retry only failed ones |
+| Partial failures in bulk | Some grades submitted, others failed | Check each status. Unconfirmed assessments may already be saved: inspect Canvas before retrying to avoid duplicate comments. Retry only confirmed unsaved failures |

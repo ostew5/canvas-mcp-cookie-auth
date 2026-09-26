@@ -13,9 +13,10 @@ This module handles all three steps transparently.
 """
 
 import base64
+import os
 import tempfile
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ..core.cache import get_course_code, get_course_id
@@ -26,19 +27,21 @@ from ..core.client import (
     upload_file_to_storage,
 )
 from ..core.config import get_config
+from ..core.credentials import is_http_request_active
 from ..core.file_validation import (
     FileValidationResult,
     format_file_size,
     sanitize_filename,
     validate_file_for_upload,
 )
+from ..core.untrusted_content import fence_untrusted_inline
 from ..core.validation import validate_params
 
 
-def register_shared_file_tools(mcp: FastMCP):
+def register_shared_file_tools(mcp: FastMCP) -> None:
     """Register file tools accessible to both students and educators."""
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def download_course_file(
         course_identifier: str | int,
@@ -47,6 +50,9 @@ def register_shared_file_tools(mcp: FastMCP):
     ) -> str:
         """Download a file from a Canvas course to the local filesystem.
 
+        Only available on a local (stdio) server. Use read_course_file to get
+        file content back in the response instead.
+
         Use list_course_files or list_module_items to find file IDs.
 
         Args:
@@ -54,6 +60,19 @@ def register_shared_file_tools(mcp: FastMCP):
             file_id: Canvas file ID
             save_directory: Local directory to save to (default: system temp dir, must exist)
         """
+        # This tool writes to the *server's* filesystem. On a local stdio server
+        # that is the caller's own machine; on a shared HTTP one it is somebody
+        # else's host, and the caller picks both the destination directory and
+        # (via the Canvas file they choose) the filename and bytes — an arbitrary
+        # write primitive against the service account. There is also no reason a
+        # remote caller would want it: they cannot read what lands there.
+        if is_http_request_active():
+            return (
+                "Error: 'download_course_file' writes to the server's filesystem and is "
+                "only available on a local (stdio) server. On this hosted server, use "
+                "read_course_file instead, which returns the content in the response."
+            )
+
         course_id = await get_course_id(course_identifier)
 
         # Get file metadata from Canvas API
@@ -83,32 +102,64 @@ def register_shared_file_tools(mcp: FastMCP):
         if not save_path.is_relative_to(save_dir):
             return "Error: Invalid filename - path outside allowed directory"
 
-        # Download the file using streaming to handle large files efficiently
+        # Create the destination exclusively. Canvas controls the filename, so a
+        # plain 'wb' open lets a course file named e.g. ".zshrc" silently truncate
+        # a real file in whatever directory was chosen. O_EXCL refuses an existing
+        # path (including a pre-planted symlink) and O_NOFOLLOW refuses to follow
+        # one, closing the swap race between the containment check and the write.
+        # O_NOFOLLOW is POSIX-only; on Windows the attribute does not exist at
+        # all, so naming it directly would raise AttributeError before os.open
+        # runs and break every local download there. O_EXCL alone still refuses
+        # an existing path, including a pre-planted symlink, which is the bulk
+        # of the protection.
+        open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(save_path, open_flags, 0o600)
+        except FileExistsError:
+            return (
+                f"Error: '{save_path}' already exists. Refusing to overwrite it — "
+                f"remove it first or pass a different save_directory."
+            )
+        except OSError as e:
+            return f"Error creating destination file: {e}"
+
+        # Wrap the descriptor immediately so it is closed even if the network call
+        # below fails before the first write, and download by streaming to handle
+        # large files efficiently.
         try:
             total_bytes = 0
-            async with canvas_authenticated_client() as client:
-                async with client.stream("GET", download_url, follow_redirects=True) as response:
-                    response.raise_for_status()
+            with os.fdopen(fd, 'wb') as f:
+                async with canvas_authenticated_client() as client:
+                    async with client.stream(
+                        "GET", download_url, follow_redirects=True
+                    ) as response:
+                        response.raise_for_status()
 
-                    with open(save_path, 'wb') as f:
                         async for chunk in response.aiter_bytes(chunk_size=8192):
                             f.write(chunk)
                             total_bytes += len(chunk)
-
-            size_str = format_file_size(total_bytes)
-            course_display = await get_course_code(course_id) or course_identifier
-
-            result = f"Downloaded: {filename}\n"
-            result += f"  Path: {save_path}\n"
-            result += f"  Size: {size_str}\n"
-            result += f"  Type: {content_type}\n"
-            result += f"  Course: {course_display}\n"
-            return result
-
         except Exception as e:
+            # We created this path, so a failed download leaves a truncated or
+            # empty file that a later reader could mistake for real content.
+            try:
+                os.unlink(save_path)
+            except OSError:
+                pass
             return f"Error downloading file: {str(e)}"
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+        size_str = format_file_size(total_bytes)
+        course_display = await get_course_code(course_id) or course_identifier
+
+        # Filename is uploader-controlled (issue 239); the on-disk path uses
+        # the sanitized value, only the display is fenced.
+        result = f"Downloaded: {fence_untrusted_inline(filename, 'file name')}\n"
+        result += f"  Path: {save_path}\n"
+        result += f"  Size: {size_str}\n"
+        result += f"  Type: {content_type}\n"
+        result += f"  Course: {course_display}\n"
+        return result
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def read_course_file(
         course_identifier: str | int,
@@ -188,7 +239,7 @@ def register_shared_file_tools(mcp: FastMCP):
             size_str = format_file_size(len(buffer))
             course_display = await get_course_code(course_id) or course_identifier
 
-            result = f"Read: {filename}\n"
+            result = f"Read: {fence_untrusted_inline(filename, 'file name')}\n"
             result += f"  Size: {size_str}\n"
             result += f"  Type: {content_type}\n"
             result += f"  Course: {course_display}\n"
@@ -199,7 +250,7 @@ def register_shared_file_tools(mcp: FastMCP):
         except Exception as e:
             return f"Error reading file: {str(e)}"
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     @validate_params
     async def list_course_files(
         course_identifier: str | int,
@@ -255,16 +306,16 @@ def register_shared_file_tools(mcp: FastMCP):
             name = f.get("display_name") or f.get("filename", "unknown")
             size = format_file_size(f.get("size", 0))
             ctype = f.get("content-type", "unknown")
-            result += f"  ID: {fid} | {name} ({size}, {ctype})\n"
+            result += f"  ID: {fid} | {fence_untrusted_inline(name, 'file name')} ({size}, {ctype})\n"
 
         result += f"\nTotal: {len(files)} file(s)"
         return result
 
 
-def register_educator_file_tools(mcp: FastMCP):
+def register_educator_file_tools(mcp: FastMCP) -> None:
     """Register educator-only file tools (upload)."""
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=False))
     @validate_params
     async def upload_course_file(
         course_identifier: str | int,
@@ -285,6 +336,18 @@ def register_educator_file_tools(mcp: FastMCP):
             display_name: Override the filename shown in Canvas
             on_duplicate: "rename" (default) or "overwrite"
         """
+        # 'file_path' reads the *server's* filesystem. On a local stdio server that
+        # is the caller's own machine; on a shared HTTP one a remote caller could
+        # name any file the service account can read and upload it into their own
+        # Canvas course. Refused outright over HTTP, matching the student upload
+        # path in student_write.py, which already blocks the same hole.
+        if is_http_request_active():
+            return (
+                "Error: 'file_path' reads files from the server and is only "
+                "available on a local (stdio) server. On this hosted server, "
+                "upload the file through Canvas directly."
+            )
+
         # Validate on_duplicate parameter
         if on_duplicate not in ("rename", "overwrite"):
             return f"Invalid on_duplicate value: '{on_duplicate}'. Must be 'rename' or 'overwrite'."
@@ -309,10 +372,13 @@ def register_educator_file_tools(mcp: FastMCP):
             "on_duplicate": on_duplicate,
         }
 
-        # Add folder path if specified
-        if folder_path:
-            # Canvas expects folder path relative to course files
-            upload_request_params["parent_folder_path"] = folder_path
+        # Canvas expects the folder path relative to course files. ALWAYS send
+        # it: omitting parent_folder_path does not mean "root", it means Canvas
+        # creates and uses a folder literally named "unfiled" (issue #198,
+        # reproduced live — A/B: no param -> "course files/unfiled";
+        # parent_folder_path="" -> "course files"). Empty string is the root, and
+        # costs no extra request, unlike looking up /folders/root for its id.
+        upload_request_params["parent_folder_path"] = folder_path or ""
 
         # Request the upload slot
         step1_response = await make_canvas_request(
